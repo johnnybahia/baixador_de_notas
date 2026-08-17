@@ -4,30 +4,38 @@ Baixador unificado de documentos fiscais - NF-e, CT-e e NFS-e
 Varre os tres ambientes nacionais por NSU usando o certificado A1 e grava
 os XMLs em uma unica pasta de saida (entrada do classificador de vencimentos).
 
-  NF-e  -> NFeDistribuicaoDFe  (SOAP)  distNSU
-  CT-e  -> CTeDistribuicaoDFe  (SOAP)  distNSU
-  NFS-e -> API ADN NFS-e       (REST)  paginacao por NSU
+  NF-e  -> NFeDistribuicaoDFe   (SOAP)  distNSU
+  CT-e  -> CTeDistribuicaoDFe   (SOAP)  distNSU
+  NFS-e -> ADN /contribuintes/DFe/{NSU} (REST) paginacao por NSU
 
 Configuracao em config.ini (ao lado deste arquivo). Estado (ultNSU por
 servico, bloqueios) em PASTA_CONTROLE - nunca no OneDrive.
 
 Requisitos:
     pip install requests cryptography openpyxl
+
+Uso:
+    python baixador.py                       # varre os tres servicos
+    python baixador.py --servico nfe cte     # so NF-e e CT-e
+    python baixador.py --status              # mostra o estado e sai
+    python baixador.py --servico nfse --nsu 0    # reprocessa do inicio
 """
 
 import os
 import re
 import sys
 import ssl
+import csv
 import json
 import gzip
 import time
 import base64
-import zipfile
+import logging
+import argparse
 import tempfile
 import configparser
 import xml.etree.ElementTree as ET
-from io import BytesIO
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -43,44 +51,10 @@ except ImportError:
     load_workbook = None
 
 
-# ===================== CONFIGURACAO =====================
-def base_execucao():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+log = logging.getLogger("baixador")
 
+SERVICOS = ("nfe", "cte", "nfse")
 
-BASE = base_execucao()
-ARQUIVO_CONFIG = BASE / "config.ini"
-
-if not ARQUIVO_CONFIG.exists():
-    print(f"config.ini nao encontrado em {BASE}")
-    print("Copie o config.ini.exemplo, ajuste os caminhos e rode de novo.")
-    sys.exit(1)
-
-CFG = configparser.ConfigParser()
-CFG.read(ARQUIVO_CONFIG, encoding="utf-8")
-
-PASTA_SAIDA = Path(CFG["PASTAS"]["saida"])
-PASTA_CONTROLE = Path(CFG["PASTAS"]["controle"])
-PASTA_PLANILHAS = Path(CFG["PASTAS"].get("planilhas", str(BASE)))
-
-CERT_PFX = Path(CFG["CERTIFICADO"]["pfx"])
-CERT_SENHA = CFG["CERTIFICADO"]["senha"]
-
-CNPJ = re.sub(r"\D", "", CFG["EMPRESA"]["cnpj"])
-CUF = CFG["EMPRESA"]["cuf"]
-TP_AMB = CFG["EMPRESA"].get("ambiente", "1")
-
-MAX_LOTES = CFG["LIMITES"].getint("max_lotes_por_execucao", 20)
-PAUSA = CFG["LIMITES"].getint("pausa_segundos", 2)
-BLOQUEIO_MIN = CFG["LIMITES"].getint("bloqueio_minutos", 65)
-
-ARQUIVO_ESTADO = PASTA_CONTROLE / "estado_nsu.json"
-ARQUIVO_LOCK = PASTA_CONTROLE / "baixador.lock"
-ARQUIVO_RELATORIO = PASTA_CONTROLE / "relatorio_faltantes.csv"
-
-# --------------------------------------------------------
 NS_NFE = "http://www.portalfiscal.inf.br/nfe"
 NS_CTE = "http://www.portalfiscal.inf.br/cte"
 
@@ -92,64 +66,191 @@ URL_CTE = {
     "1": "https://www1.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx",
     "2": "https://hom1.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx",
 }
+# Ambiente de Dados Nacional da NFS-e (Sefin Nacional)
 URL_NFSE = {
-    "1": "https://adn.nfse.gov.br/contribuintes",
-    "2": "https://adn.producaorestrita.nfse.gov.br/contribuintes",
+    "1": "https://adn.nfse.gov.br",
+    "2": "https://adn.producaorestrita.nfse.gov.br",
 }
 
 ACTION_NFE = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
 ACTION_CTE = "http://www.portalfiscal.inf.br/cte/wsdl/CTeDistribuicaoDFe/cteDistDFeInteresse"
 
-# cStat que encerram a varredura de forma normal ou definitiva
-CSTAT_SEM_DOCUMENTO = {"137", "138"}
-CSTAT_CONSUMO_INDEVIDO = "656"
+# cStat do DistribuicaoDFe que interessam ao controle da varredura
+CSTAT_NENHUM_DOCUMENTO = "137"   # nenhum documento localizado
+CSTAT_DOCUMENTO_LOCALIZADO = "138"
+CSTAT_CONSUMO_INDEVIDO = "656"   # bloqueio de 1h imposto pela SEFAZ
+
+# StatusProcessamento devolvido pelo ADN da NFS-e
+NFSE_SEM_DOCUMENTO = "NENHUM_DOCUMENTO_LOCALIZADO"
+NFSE_REJEICAO = "REJEICAO"
+
+# Raizes que representam o documento fiscal em si (o resto e evento/resumo)
+RAIZES_DOCUMENTO = {
+    "nfeProc", "NFe",
+    "cteProc", "CTeOSProc", "cteSimpProc", "CTe",
+    "nfseProc", "NFSe",
+}
+
+# Id="NFe3524...", Id="CTe...", Id="NFS..." ou a propria chave solta
+RE_CHAVE_ID = re.compile(r'Id="(?:NFe|CTe|NFS|DPS)?(\d{44,50})"')
+RE_CHAVE_SOLTA = re.compile(r"(?<!\d)(\d{44,50})(?!\d)")
+
+
+# ===================== CONFIGURACAO =====================
+def base_execucao():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+@dataclass
+class Config:
+    cnpj: str
+    cuf: str
+    tp_amb: str = "1"
+    cert_pfx: Path = None
+    cert_senha: str = ""
+    pasta_saida: Path = None
+    pasta_controle: Path = None
+    pasta_planilhas: Path = None
+    servicos: dict = field(default_factory=lambda: dict.fromkeys(SERVICOS, True))
+    max_lotes: int = 20
+    pausa: int = 2
+    bloqueio_min: int = 65
+    timeout: int = 90
+
+    @property
+    def arquivo_estado(self):
+        return self.pasta_controle / "estado_nsu.json"
+
+    @property
+    def arquivo_lock(self):
+        return self.pasta_controle / "baixador.lock"
+
+    @property
+    def arquivo_relatorio(self):
+        return self.pasta_controle / "relatorio_faltantes.csv"
+
+    @property
+    def arquivo_log(self):
+        return self.pasta_controle / "baixador.log"
+
+    @classmethod
+    def de_arquivo(cls, caminho):
+        cfg = configparser.ConfigParser()
+        lidos = cfg.read(caminho, encoding="utf-8")
+        if not lidos:
+            raise FileNotFoundError(f"Nao consegui ler o config: {caminho}")
+
+        def obrig(secao, chave):
+            valor = cfg.get(secao, chave, fallback="").strip()
+            if not valor:
+                raise ValueError(f"config.ini: preencha [{secao}] {chave}")
+            return valor
+
+        cnpj = re.sub(r"\D", "", obrig("EMPRESA", "cnpj"))
+        if len(cnpj) != 14:
+            raise ValueError("config.ini: [EMPRESA] cnpj deve ter 14 digitos")
+
+        tp_amb = cfg.get("EMPRESA", "ambiente", fallback="1").strip()
+        if tp_amb not in ("1", "2"):
+            raise ValueError("config.ini: [EMPRESA] ambiente deve ser 1 (producao) ou 2 (homologacao)")
+
+        base = base_execucao()
+        pasta_saida = Path(obrig("PASTAS", "saida")).expanduser()
+        pasta_controle = Path(obrig("PASTAS", "controle")).expanduser()
+        pasta_planilhas = Path(cfg.get("PASTAS", "planilhas", fallback=str(base)).strip() or base).expanduser()
+
+        ligado = {"sim", "true", "1", "s", "yes"}
+        servicos = {
+            s: cfg.get("SERVICOS", s, fallback="sim").strip().lower() in ligado
+            for s in SERVICOS
+        }
+
+        return cls(
+            cnpj=cnpj,
+            cuf=obrig("EMPRESA", "cuf"),
+            tp_amb=tp_amb,
+            cert_pfx=Path(obrig("CERTIFICADO", "pfx")).expanduser(),
+            cert_senha=cfg.get("CERTIFICADO", "senha", fallback=""),
+            pasta_saida=pasta_saida,
+            pasta_controle=pasta_controle,
+            pasta_planilhas=pasta_planilhas,
+            servicos=servicos,
+            max_lotes=cfg.getint("LIMITES", "max_lotes_por_execucao", fallback=20),
+            pausa=cfg.getint("LIMITES", "pausa_segundos", fallback=2),
+            bloqueio_min=cfg.getint("LIMITES", "bloqueio_minutos", fallback=65),
+            timeout=cfg.getint("LIMITES", "timeout_segundos", fallback=90),
+        )
+
+
+def configurar_log(cfg, verboso=False):
+    log.setLevel(logging.DEBUG if verboso else logging.INFO)
+    log.handlers.clear()
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(console)
+
+    try:
+        cfg.pasta_controle.mkdir(parents=True, exist_ok=True)
+        arquivo = logging.FileHandler(cfg.arquivo_log, encoding="utf-8")
+        arquivo.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(arquivo)
+    except Exception as e:  # log em arquivo e conveniencia, nao requisito
+        print(f"AVISO: sem log em arquivo ({e})")
 
 
 # ===================== LOCK =====================
-def adquirir_lock():
-    PASTA_CONTROLE.mkdir(parents=True, exist_ok=True)
-    if ARQUIVO_LOCK.exists():
+def adquirir_lock(cfg):
+    cfg.pasta_controle.mkdir(parents=True, exist_ok=True)
+    if cfg.arquivo_lock.exists():
         try:
-            dados = json.loads(ARQUIVO_LOCK.read_text(encoding="utf-8"))
+            dados = json.loads(cfg.arquivo_lock.read_text(encoding="utf-8"))
             inicio = datetime.fromisoformat(dados["inicio"])
             if datetime.now() - inicio < timedelta(hours=2):
-                print(f"Execucao em andamento (PID {dados.get('pid')}). Saindo.")
+                log.info("Execucao em andamento (PID %s). Saindo.", dados.get("pid"))
                 return False
-            print("Lock antigo (>2h), assumindo travado.")
+            log.info("Lock antigo (>2h), assumindo travado.")
         except Exception:
             pass
-    ARQUIVO_LOCK.write_text(
+    cfg.arquivo_lock.write_text(
         json.dumps({"pid": os.getpid(), "inicio": datetime.now().isoformat()}),
         encoding="utf-8",
     )
     return True
 
 
-def liberar_lock():
+def liberar_lock(cfg):
     try:
-        ARQUIVO_LOCK.unlink(missing_ok=True)
+        cfg.arquivo_lock.unlink(missing_ok=True)
     except Exception:
         pass
 
 
 # ===================== ESTADO =====================
-def carregar_estado():
-    if ARQUIVO_ESTADO.exists():
+def carregar_estado(cfg):
+    if cfg.arquivo_estado.exists():
         try:
-            return json.loads(ARQUIVO_ESTADO.read_text(encoding="utf-8"))
+            return json.loads(cfg.arquivo_estado.read_text(encoding="utf-8"))
         except Exception:
-            print("Estado corrompido, recriando do zero.")
+            log.warning("Estado corrompido, recriando do zero.")
     return {}
 
 
-def salvar_estado(estado):
-    ARQUIVO_ESTADO.write_text(
+def salvar_estado(cfg, estado):
+    cfg.arquivo_estado.parent.mkdir(parents=True, exist_ok=True)
+    temporario = cfg.arquivo_estado.with_suffix(".tmp")
+    temporario.write_text(
         json.dumps(estado, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    temporario.replace(cfg.arquivo_estado)
 
 
 def estado_servico(estado, servico):
-    return estado.setdefault(servico, {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None})
+    return estado.setdefault(
+        servico, {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None}
+    )
 
 
 def bloqueado(info):
@@ -162,11 +263,18 @@ def bloqueado(info):
         return None
 
 
-def bloquear(info, motivo):
-    ate = datetime.now() + timedelta(minutes=BLOQUEIO_MIN)
+def bloquear(cfg, info, motivo):
+    ate = datetime.now() + timedelta(minutes=cfg.bloqueio_min)
     info["bloqueado_ate"] = ate.isoformat()
     info["motivo_bloqueio"] = motivo
-    print(f"    !! BLOQUEADO ate {ate:%d/%m %H:%M} ({motivo})")
+    log.warning("    !! BLOQUEADO ate %s (%s)", ate.strftime("%d/%m %H:%M"), motivo)
+
+
+def como_inteiro(valor, padrao=0):
+    try:
+        return int(str(valor).strip())
+    except (TypeError, ValueError):
+        return padrao
 
 
 # ===================== CERTIFICADO =====================
@@ -185,22 +293,25 @@ class TLSAdapter(HTTPAdapter):
         return super().init_poolmanager(*args, **kwargs)
 
 
-def preparar_certificado():
-    if not CERT_PFX.exists():
-        raise FileNotFoundError(f"Certificado nao encontrado: {CERT_PFX}")
-    chave, cert, cadeia = pkcs12.load_key_and_certificates(
-        CERT_PFX.read_bytes(), CERT_SENHA.encode("utf-8")
-    )
+def preparar_certificado(cfg):
+    if not cfg.cert_pfx.exists():
+        raise FileNotFoundError(f"Certificado nao encontrado: {cfg.cert_pfx}")
+    try:
+        chave, cert, cadeia = pkcs12.load_key_and_certificates(
+            cfg.cert_pfx.read_bytes(), cfg.cert_senha.encode("utf-8")
+        )
+    except ValueError as e:
+        raise ValueError(f"Nao consegui abrir o .pfx (senha errada?): {e}") from e
     if cert is None or chave is None:
         raise ValueError("Nao consegui extrair certificado/chave do .pfx")
 
     validade = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
     validade = validade.replace(tzinfo=None)
-    agora = datetime.now()
+    agora = datetime.utcnow()
     if validade < agora:
         raise ValueError(f"Certificado VENCIDO em {validade:%d/%m/%Y}")
     if (validade - agora).days < 15:
-        print(f"AVISO: certificado vence em {validade:%d/%m/%Y}")
+        log.warning("AVISO: certificado vence em %s", validade.strftime("%d/%m/%Y"))
 
     fd_c, pem_cert = tempfile.mkstemp(suffix=".pem")
     fd_k, pem_key = tempfile.mkstemp(suffix=".pem")
@@ -221,38 +332,70 @@ def nova_sessao(cert_par):
 
 
 # ===================== GRAVACAO =====================
-def nome_por_chave(conteudo, prefixo):
-    m = re.search(r"\d{44,50}", conteudo)
-    if m:
-        return f"{m.group(0)}.xml"
-    return f"{prefixo}_{datetime.now():%Y%m%d%H%M%S%f}.xml"
+def raiz_do_xml(conteudo):
+    """Nome da tag raiz, sem namespace. String vazia se o XML for ilegivel."""
+    try:
+        return ET.fromstring(conteudo).tag.split("}")[-1]
+    except ET.ParseError:
+        return ""
 
 
-def gravar_xml(conteudo, prefixo, contadores):
-    """Grava apenas documentos processaveis; eventos/resumos vao para subpasta."""
-    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
+def extrair_chave(conteudo):
+    """Chave de acesso (44 digitos NF-e/CT-e, 50 na NFS-e), ou None."""
+    m = RE_CHAVE_ID.search(conteudo) or RE_CHAVE_SOLTA.search(conteudo)
+    return m.group(1) if m else None
 
-    principal = any(
-        marca in conteudo
-        for marca in ("<nfeProc", "<cteProc", "<CTeOSProc", "<NFSe", "<nfseProc")
-    )
-    if principal:
-        destino = PASTA_SAIDA / nome_por_chave(conteudo, prefixo)
+
+def nome_arquivo(conteudo, prefixo, raiz=None, nsu=None, documento=True):
+    """
+    Documento fiscal: <chave>.xml - permite deduplicar por chave.
+    Evento/resumo: <chave>-<raiz>-<nsu>.xml - varios eventos por chave,
+    entao o nome precisa de discriminante ou um sobrescreveria o outro.
+    """
+    chave = extrair_chave(conteudo)
+    if documento and chave:
+        return f"{chave}.xml"
+
+    raiz = raiz or raiz_do_xml(conteudo) or prefixo
+    sufixo = str(nsu).strip() if nsu else datetime.now().strftime("%Y%m%d%H%M%S%f")
+    base = chave or prefixo
+    return f"{base}-{raiz}-{sufixo}.xml"
+
+
+def gravar_xml(cfg, conteudo, prefixo, contadores, nsu=None):
+    """Grava documentos processaveis na raiz; eventos/resumos em subpasta."""
+    raiz = raiz_do_xml(conteudo)
+    documento = raiz in RAIZES_DOCUMENTO
+
+    if documento:
+        pasta = cfg.pasta_saida
         contadores["documentos"] += 1
     else:
-        pasta_eventos = PASTA_SAIDA / "_EVENTOS_E_RESUMOS"
-        pasta_eventos.mkdir(parents=True, exist_ok=True)
-        destino = pasta_eventos / nome_por_chave(conteudo, prefixo)
+        pasta = cfg.pasta_saida / "_EVENTOS_E_RESUMOS"
         contadores["eventos"] += 1
 
+    pasta.mkdir(parents=True, exist_ok=True)
+    destino = pasta / nome_arquivo(conteudo, prefixo, raiz, nsu, documento)
     if destino.exists():
+        contadores["documentos" if documento else "eventos"] -= 1
         contadores["duplicados"] += 1
-        return
+        return None
     destino.write_text(conteudo, encoding="utf-8")
+    return destino
+
+
+def descompactar_doczip(texto_b64):
+    """docZip da SEFAZ / ArquivoXml do ADN: base64 de gzip (as vezes XML puro)."""
+    bruto = base64.b64decode(texto_b64)
+    try:
+        bruto = gzip.decompress(bruto)
+    except (OSError, EOFError):
+        pass
+    return bruto.decode("utf-8", errors="replace").lstrip("\ufeff")
 
 
 # ===================== MODULO SOAP (NF-e / CT-e) =====================
-def montar_envelope(servico, ult_nsu):
+def montar_envelope(cfg, servico, ult_nsu):
     if servico == "nfe":
         ns = NS_NFE
         wsdl = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe"
@@ -273,9 +416,9 @@ def montar_envelope(servico, ult_nsu):
         f'<{metodo} xmlns="{wsdl}">'
         f"<{tag_dados}>"
         f'<distDFeInt xmlns="{ns}" versao="{versao}">'
-        f"<tpAmb>{TP_AMB}</tpAmb>"
-        f"<cUFAutor>{CUF}</cUFAutor>"
-        f"<CNPJ>{CNPJ}</CNPJ>"
+        f"<tpAmb>{cfg.tp_amb}</tpAmb>"
+        f"<cUFAutor>{cfg.cuf}</cUFAutor>"
+        f"<CNPJ>{cfg.cnpj}</CNPJ>"
         f"<distNSU><ultNSU>{str(ult_nsu).zfill(15)}</ultNSU></distNSU>"
         "</distDFeInt>"
         f"</{tag_dados}>"
@@ -285,39 +428,33 @@ def montar_envelope(servico, ult_nsu):
     )
 
 
-def descompactar_doczip(texto_b64):
-    bruto = base64.b64decode(texto_b64)
-    try:
-        return gzip.decompress(bruto).decode("utf-8", errors="replace")
-    except Exception:
-        return bruto.decode("utf-8", errors="replace")
-
-
-def rodar_soap(servico, sessao, info, contadores):
+def rodar_soap(cfg, servico, sessao, info, contadores):
     ns = NS_NFE if servico == "nfe" else NS_CTE
-    url = (URL_NFE if servico == "nfe" else URL_CTE)[TP_AMB]
+    url = (URL_NFE if servico == "nfe" else URL_CTE)[cfg.tp_amb]
     action = ACTION_NFE if servico == "nfe" else ACTION_CTE
     prefixo = servico.upper()
 
-    for lote in range(1, MAX_LOTES + 1):
+    for lote in range(1, cfg.max_lotes + 1):
         ult = info["ultNSU"]
-        print(f"  lote {lote}/{MAX_LOTES} a partir do NSU {ult}")
+        log.info("  lote %s/%s a partir do NSU %s", lote, cfg.max_lotes, ult)
         try:
             resp = sessao.post(
                 url,
-                data=montar_envelope(servico, ult).encode("utf-8"),
-                headers={"Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"'},
-                timeout=90,
+                data=montar_envelope(cfg, servico, ult).encode("utf-8"),
+                headers={
+                    "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"'
+                },
+                timeout=cfg.timeout,
             )
             resp.raise_for_status()
         except Exception as e:
-            print(f"    falha de rede: {e}")
+            log.error("    falha de rede: %s", e)
             return
 
         try:
             raiz = ET.fromstring(resp.content)
         except ET.ParseError as e:
-            print(f"    resposta ilegivel: {e}")
+            log.error("    resposta ilegivel: %s", e)
             return
 
         def txt(tag):
@@ -327,126 +464,155 @@ def rodar_soap(servico, sessao, info, contadores):
         cstat, xmotivo = txt("cStat"), txt("xMotivo")
         novo_ult, max_nsu = txt("ultNSU"), txt("maxNSU")
         docs = raiz.findall(f".//{{{ns}}}docZip")
-        print(f"    cStat {cstat} - {xmotivo} | {len(docs)} doc(s)")
+        log.info("    cStat %s - %s | %s doc(s)", cstat, xmotivo, len(docs))
 
         if cstat == CSTAT_CONSUMO_INDEVIDO:
-            bloquear(info, f"{cstat} {xmotivo}")
+            bloquear(cfg, info, f"{cstat} {xmotivo}")
             return
 
         for doc in docs:
             try:
-                gravar_xml(descompactar_doczip(doc.text), prefixo, contadores)
+                gravar_xml(
+                    cfg,
+                    descompactar_doczip(doc.text),
+                    prefixo,
+                    contadores,
+                    nsu=doc.get("NSU"),
+                )
             except Exception as e:
-                print(f"    erro ao descompactar doc: {e}")
+                log.error("    erro ao processar doc NSU %s: %s", doc.get("NSU"), e)
 
         if novo_ult:
             info["ultNSU"] = novo_ult
         if max_nsu:
             info["maxNSU"] = max_nsu
 
-        if cstat in CSTAT_SEM_DOCUMENTO and not docs:
-            print("    nada novo, varredura concluida.")
-            return
-        if max_nsu and novo_ult and int(novo_ult) >= int(max_nsu):
-            print("    alcancou o maxNSU, varredura concluida.")
-            return
         if not docs:
+            if cstat == CSTAT_NENHUM_DOCUMENTO:
+                log.info("    nada novo, varredura concluida.")
+            elif cstat != CSTAT_DOCUMENTO_LOCALIZADO:
+                log.warning("    parando: cStat %s - %s", cstat, xmotivo)
             return
-        time.sleep(PAUSA)
+        if como_inteiro(novo_ult) >= como_inteiro(max_nsu, -1) > 0:
+            log.info("    alcancou o maxNSU, varredura concluida.")
+            return
+        if como_inteiro(novo_ult) <= como_inteiro(ult):
+            log.warning("    NSU nao avancou (%s); interrompendo para nao repetir.", ult)
+            return
+        time.sleep(cfg.pausa)
 
-    print(f"    limite de {MAX_LOTES} lote(s) atingido; continua na proxima execucao.")
+    log.info(
+        "    limite de %s lote(s) atingido; continua na proxima execucao.", cfg.max_lotes
+    )
 
 
 # ===================== MODULO REST (NFS-e / ADN) =====================
-def rodar_nfse(sessao, info, contadores):
-    base_url = URL_NFSE[TP_AMB]
+def rodar_nfse(cfg, sessao, info, contadores):
+    """
+    ADN NFS-e: GET /contribuintes/DFe/{ultimo NSU processado}?lote=true
+    Devolve LoteDFe com ArquivoXml (base64 de gzip) e o NSU de cada item.
+    Nao ha maxNSU: para quando o lote vier vazio ou HTTP 404.
+    """
+    base_url = URL_NFSE[cfg.tp_amb]
 
-    for lote in range(1, MAX_LOTES + 1):
-        ult = info["ultNSU"]
-        url = f"{base_url}/nfse"
-        print(f"  lote {lote}/{MAX_LOTES} a partir do NSU {ult}")
+    for lote in range(1, cfg.max_lotes + 1):
+        ult = como_inteiro(info["ultNSU"])
+        log.info("  lote %s/%s a partir do NSU %s", lote, cfg.max_lotes, ult)
         try:
             resp = sessao.get(
-                url,
-                params={"NSU": str(ult), "tipoNSU": "1", "lote": "true"},
+                f"{base_url}/contribuintes/DFe/{ult}",
+                params={"lote": "true", "cnpjConsulta": cfg.cnpj},
                 headers={"Accept": "application/json"},
-                timeout=90,
+                timeout=cfg.timeout,
             )
         except Exception as e:
-            print(f"    falha de rede: {e}")
+            log.error("    falha de rede: %s", e)
             return
 
         if resp.status_code == 404:
-            print("    nada novo, varredura concluida.")
+            log.info("    nada novo, varredura concluida.")
             return
         if resp.status_code in (401, 403):
-            print(f"    acesso negado ({resp.status_code}). Confira se o CNPJ do")
-            print("    certificado e ator (tomador) das notas e se o ADN esta habilitado.")
+            log.error("    acesso negado (%s). Confira se o CNPJ do", resp.status_code)
+            log.error("    certificado e ator (tomador) das notas e se o ADN esta habilitado.")
             return
         if resp.status_code == 429:
-            bloquear(info, "429 too many requests")
+            bloquear(cfg, info, "429 too many requests")
             return
         if resp.status_code >= 400:
-            print(f"    HTTP {resp.status_code}: {resp.text[:300]}")
+            log.error("    HTTP %s: %s", resp.status_code, resp.text[:300])
             return
 
         try:
             dados = resp.json()
         except ValueError:
-            print(f"    resposta nao-JSON: {resp.text[:300]}")
+            log.error("    resposta nao-JSON: %s", resp.text[:300])
             return
 
         documentos = dados.get("LoteDFe") or dados.get("loteDFe") or []
-        print(f"    {len(documentos)} documento(s)")
+        status = dados.get("StatusProcessamento") or dados.get("statusProcessamento") or ""
+        log.info("    %s | %s documento(s)", status or "sem status", len(documentos))
 
+        for erro in dados.get("Erros") or []:
+            log.error("    erro ADN: %s", erro)
+
+        maior_nsu = ult
         for item in documentos:
-            conteudo_b64 = (
-                item.get("ArquivoXml") or item.get("arquivoXml")
-                or item.get("DocumentoXmlGZipB64") or item.get("documentoXmlGZipB64")
-            )
+            conteudo_b64 = item.get("ArquivoXml") or item.get("arquivoXml")
+            nsu_item = como_inteiro(item.get("NSU") or item.get("nsu"), 0)
+            maior_nsu = max(maior_nsu, nsu_item)
             if not conteudo_b64:
                 continue
             try:
-                gravar_xml(descompactar_doczip(conteudo_b64), "NFSE", contadores)
+                gravar_xml(
+                    cfg,
+                    descompactar_doczip(conteudo_b64),
+                    "NFSE",
+                    contadores,
+                    nsu=nsu_item or None,
+                )
             except Exception as e:
-                print(f"    erro ao processar documento: {e}")
+                log.error("    erro ao processar NSU %s: %s", nsu_item, e)
 
-        novo_ult = str(
-            dados.get("UltimoNSU") or dados.get("ultimoNSU")
-            or (documentos[-1].get("NSU") if documentos else "") or ""
-        )
-        max_nsu = str(dados.get("MaximoNSU") or dados.get("maximoNSU") or "")
-        if novo_ult:
-            info["ultNSU"] = novo_ult
-        if max_nsu:
-            info["maxNSU"] = max_nsu
+        if maior_nsu > ult:
+            info["ultNSU"] = str(maior_nsu)
+            info["maxNSU"] = str(maior_nsu)
 
-        if not documentos:
+        if status == NFSE_REJEICAO:
+            log.error("    ADN rejeitou a consulta; interrompendo.")
             return
-        if max_nsu and novo_ult and int(novo_ult) >= int(max_nsu):
-            print("    alcancou o maxNSU, varredura concluida.")
+        if not documentos or status == NFSE_SEM_DOCUMENTO:
+            log.info("    nada novo, varredura concluida.")
             return
-        time.sleep(PAUSA)
+        if maior_nsu <= ult:
+            log.warning("    NSU nao avancou (%s); interrompendo para nao repetir.", ult)
+            return
+        time.sleep(cfg.pausa)
 
-    print(f"    limite de {MAX_LOTES} lote(s) atingido; continua na proxima execucao.")
+    log.info(
+        "    limite de %s lote(s) atingido; continua na proxima execucao.", cfg.max_lotes
+    )
 
 
 # ===================== CONFERENCIA COM A PLANILHA =====================
-def conferir_planilhas():
-    if load_workbook is None or not PASTA_PLANILHAS.exists():
+def conferir_planilhas(cfg):
+    if load_workbook is None:
+        log.info("\nConferencia pulada (openpyxl nao instalado).")
         return
-    arquivos = [c for c in PASTA_PLANILHAS.glob("*.xls*") if not c.name.startswith("~$")]
+    if not cfg.pasta_planilhas.exists():
+        return
+    arquivos = [c for c in cfg.pasta_planilhas.glob("*.xls*") if not c.name.startswith("~$")]
     if not arquivos:
         return
 
-    baixadas = {p.stem for p in PASTA_SAIDA.glob("*.xml")}
+    baixadas = {p.stem for p in cfg.pasta_saida.glob("*.xml")}
     faltantes = []
 
     for caminho in arquivos:
         try:
             wb = load_workbook(caminho, read_only=True, data_only=True)
         except Exception as e:
-            print(f"  nao consegui ler {caminho.name}: {e}")
+            log.warning("  nao consegui ler %s: %s", caminho.name, e)
             continue
         try:
             ws = wb[wb.sheetnames[0]]
@@ -466,7 +632,7 @@ def conferir_planilhas():
                 if not linha or not any(v is not None and str(v).strip() for v in linha):
                     continue
                 chave = re.sub(r"\D", "", campo(linha, "Chave"))
-                if len(chave) != 44 or chave in baixadas:
+                if len(chave) not in (44, 50) or chave in baixadas:
                     continue
                 faltantes.append([
                     caminho.name, chave, campo(linha, "Tipo"), campo(linha, "Num"),
@@ -476,75 +642,143 @@ def conferir_planilhas():
             wb.close()
 
     if not faltantes:
-        print("\nConferencia: todas as chaves das planilhas estao na pasta de saida.")
+        log.info("\nConferencia: todas as chaves das planilhas estao na pasta de saida.")
         return
 
-    import csv
-    with open(ARQUIVO_RELATORIO, "w", newline="", encoding="utf-8-sig") as f:
+    with open(cfg.arquivo_relatorio, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["planilha", "chave", "tipo", "numero", "data_aut", "valor", "emissor"])
         w.writerows(faltantes)
-    print(f"\nConferencia: {len(faltantes)} chave(s) da planilha NAO chegaram.")
-    print(f"Detalhes em: {ARQUIVO_RELATORIO}")
-    print("Causa comum: documento fora da janela de 90 dias do Ambiente Nacional.")
+    log.warning("\nConferencia: %s chave(s) da planilha NAO chegaram.", len(faltantes))
+    log.info("Detalhes em: %s", cfg.arquivo_relatorio)
+    log.info("Causa comum: documento fora da janela de 90 dias do Ambiente Nacional.")
 
 
 # ===================== MAIN =====================
-def main():
-    PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-    PASTA_CONTROLE.mkdir(parents=True, exist_ok=True)
+def montar_argumentos(argv=None):
+    p = argparse.ArgumentParser(
+        description="Baixa XML de NF-e, CT-e e NFS-e pelos ambientes nacionais."
+    )
+    p.add_argument("--config", type=Path, default=base_execucao() / "config.ini",
+                   help="caminho do config.ini")
+    p.add_argument("--servico", nargs="+", choices=SERVICOS, metavar="SERVICO",
+                   help=f"limita a varredura ({', '.join(SERVICOS)})")
+    p.add_argument("--nsu", type=int,
+                   help="forca o NSU inicial (exige um unico --servico)")
+    p.add_argument("--max-lotes", type=int, help="sobrepoe o limite do config.ini")
+    p.add_argument("--ignorar-bloqueio", action="store_true",
+                   help="ignora o bloqueio gravado no estado (cuidado com o 656)")
+    p.add_argument("--sem-conferencia", action="store_true",
+                   help="nao confere as planilhas no fim")
+    p.add_argument("--status", action="store_true",
+                   help="mostra o estado atual (NSU/bloqueios) e sai")
+    p.add_argument("-v", "--verbose", action="store_true", help="log detalhado")
+    return p.parse_args(argv)
 
-    if not adquirir_lock():
-        return
+
+def mostrar_status(cfg):
+    estado = carregar_estado(cfg)
+    log.info("Estado em %s", cfg.arquivo_estado)
+    for servico in SERVICOS:
+        info = estado.get(servico)
+        ligado = "ligado" if cfg.servicos.get(servico) else "desligado"
+        if not info:
+            log.info("  %-5s [%s] nunca executado", servico, ligado)
+            continue
+        ate = bloqueado(info)
+        trava = f" | BLOQUEADO ate {ate:%d/%m %H:%M}" if ate else ""
+        log.info("  %-5s [%s] ultNSU=%s maxNSU=%s%s",
+                 servico, ligado, info.get("ultNSU"), info.get("maxNSU"), trava)
+
+
+def main(argv=None):
+    args = montar_argumentos(argv)
+
+    if not args.config.exists():
+        print(f"config.ini nao encontrado em {args.config}")
+        print("Copie o config.ini.exemplo, ajuste os caminhos e rode de novo.")
+        return 1
+    try:
+        cfg = Config.de_arquivo(args.config)
+    except (ValueError, FileNotFoundError, configparser.Error) as e:
+        print(f"ERRO no config.ini: {e}")
+        return 1
+
+    if args.max_lotes:
+        cfg.max_lotes = args.max_lotes
+
+    configurar_log(cfg, args.verbose)
+
+    if args.status:
+        mostrar_status(cfg)
+        return 0
+
+    escolhidos = args.servico or [s for s in SERVICOS if cfg.servicos.get(s)]
+    if args.nsu is not None and len(escolhidos) != 1:
+        print("--nsu exige exatamente um --servico")
+        return 1
+    if not escolhidos:
+        log.info("Nenhum servico ativo no config.ini.")
+        return 0
+
+    cfg.pasta_saida.mkdir(parents=True, exist_ok=True)
+    cfg.pasta_controle.mkdir(parents=True, exist_ok=True)
+
+    if not adquirir_lock(cfg):
+        return 1
 
     pem_cert = pem_key = None
     try:
         try:
-            pem_cert, pem_key = preparar_certificado()
+            pem_cert, pem_key = preparar_certificado(cfg)
         except Exception as e:
-            print(f"ERRO no certificado: {e}")
-            return
+            log.error("ERRO no certificado: %s", e)
+            return 1
 
         sessao = nova_sessao((pem_cert, pem_key))
-        estado = carregar_estado()
+        estado = carregar_estado(cfg)
         contadores = {"documentos": 0, "eventos": 0, "duplicados": 0}
 
-        servicos = [
-            ("nfe", "NF-e", lambda i, c: rodar_soap("nfe", sessao, i, c)),
-            ("cte", "CT-e", lambda i, c: rodar_soap("cte", sessao, i, c)),
-            ("nfse", "NFS-e", lambda i, c: rodar_nfse(sessao, i, c)),
-        ]
+        rotulos = {"nfe": "NF-e", "cte": "CT-e", "nfse": "NFS-e"}
+        executores = {
+            "nfe": lambda i, c: rodar_soap(cfg, "nfe", sessao, i, c),
+            "cte": lambda i, c: rodar_soap(cfg, "cte", sessao, i, c),
+            "nfse": lambda i, c: rodar_nfse(cfg, sessao, i, c),
+        }
 
-        for chave_cfg, rotulo, executar in servicos:
-            if CFG["SERVICOS"].get(chave_cfg, "sim").strip().lower() not in ("sim", "true", "1"):
-                print(f"\n== {rotulo}: desativado no config.ini ==")
-                continue
+        for servico in escolhidos:
+            info = estado_servico(estado, servico)
+            log.info("\n== %s ==", rotulos[servico])
 
-            info = estado_servico(estado, chave_cfg)
-            print(f"\n== {rotulo} ==")
+            if args.nsu is not None:
+                log.info("  NSU inicial forcado para %s", args.nsu)
+                info["ultNSU"] = str(args.nsu)
+
             ate = bloqueado(info)
-            if ate:
+            if ate and not args.ignorar_bloqueio:
                 restante = int((ate - datetime.now()).total_seconds() // 60) + 1
-                print(f"  bloqueado por ~{restante} min (ate {ate:%H:%M}). Pulando.")
+                log.info("  bloqueado por ~%s min (ate %s). Pulando.", restante, ate.strftime("%H:%M"))
                 continue
             info["bloqueado_ate"] = None
+            info.pop("motivo_bloqueio", None)
 
             try:
-                executar(info, contadores)
+                executores[servico](info, contadores)
             except Exception as e:
-                print(f"  erro inesperado: {e}")
+                log.exception("  erro inesperado: %s", e)
             finally:
-                salvar_estado(estado)
+                salvar_estado(cfg, estado)
 
-        salvar_estado(estado)
-        print(
-            f"\n---\nDocumentos gravados: {contadores['documentos']}"
-            f" | eventos/resumos: {contadores['eventos']}"
-            f" | ja existentes: {contadores['duplicados']}"
+        salvar_estado(cfg, estado)
+        log.info(
+            "\n---\nDocumentos gravados: %s | eventos/resumos: %s | ja existentes: %s",
+            contadores["documentos"], contadores["eventos"], contadores["duplicados"],
         )
-        print(f"Pasta de saida: {PASTA_SAIDA}")
+        log.info("Pasta de saida: %s", cfg.pasta_saida)
 
-        conferir_planilhas()
+        if not args.sem_conferencia:
+            conferir_planilhas(cfg)
+        return 0
     finally:
         for caminho in (pem_cert, pem_key):
             if caminho:
@@ -552,8 +786,8 @@ def main():
                     os.unlink(caminho)
                 except Exception:
                     pass
-        liberar_lock()
+        liberar_lock(cfg)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
