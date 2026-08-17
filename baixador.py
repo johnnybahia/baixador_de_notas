@@ -36,7 +36,7 @@ import tempfile
 import configparser
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -66,10 +66,15 @@ URL_CTE = {
     "1": "https://www1.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx",
     "2": "https://hom1.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx",
 }
-# Ambiente de Dados Nacional da NFS-e (Sefin Nacional)
+# Ambiente de Dados Nacional da NFS-e (distribuicao por NSU)
 URL_NFSE = {
     "1": "https://adn.nfse.gov.br",
     "2": "https://adn.producaorestrita.nfse.gov.br",
+}
+# Sefin Nacional da NFS-e (consulta avulsa por chave de acesso)
+URL_SEFIN_NFSE = {
+    "1": "https://sefin.nfse.gov.br/SefinNacional",
+    "2": "https://sefin.producaorestrita.nfse.gov.br/SefinNacional",
 }
 
 ACTION_NFE = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"
@@ -95,6 +100,18 @@ RAIZES_DOCUMENTO = {
 RE_CHAVE_ID = re.compile(r'Id="(?:NFe|CTe|NFS|DPS)?(\d{44,50})"')
 RE_CHAVE_SOLTA = re.compile(r"(?<!\d)(\d{44,50})(?!\d)")
 
+# Tags de data, em ordem de preferencia: a primeira encontrada define a data
+# do documento (emissao quando existe, senao autorizacao/registro).
+TAGS_DATA = (
+    "dhEmi", "dEmi", "dhProc", "dhRecbto",
+    "dhEvento", "dhRegEvento", "DataEmissao", "dhProcessamento",
+)
+RE_DATA_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+# Modelo do documento: posicoes 21-22 da chave de 44 digitos
+MODELO_SERVICO = {"55": "nfe", "65": "nfe", "57": "cte", "67": "cte"}
+MAX_CHAVES = 10
+
 
 # ===================== CONFIGURACAO =====================
 def base_execucao():
@@ -118,6 +135,8 @@ class Config:
     pausa: int = 2
     bloqueio_min: int = 65
     timeout: int = 90
+    periodo_de: date = None
+    periodo_ate: date = None
 
     @property
     def arquivo_estado(self):
@@ -167,6 +186,24 @@ class Config:
             for s in SERVICOS
         }
 
+        def inteiro(secao, chave, padrao):
+            """getint proprio: a opcao existir vazia no .ini nao pode estourar."""
+            bruto = cfg.get(secao, chave, fallback="").strip()
+            if not bruto:
+                return padrao
+            try:
+                return int(bruto)
+            except ValueError:
+                raise ValueError(
+                    f"config.ini: [{secao}] {chave} deve ser um numero ({bruto!r})"
+                ) from None
+
+        periodo_de = ler_data(cfg.get("PERIODO", "de", fallback=""))
+        periodo_ate = ler_data(cfg.get("PERIODO", "ate", fallback=""))
+        ultimos = inteiro("PERIODO", "ultimos_dias", 0)
+        if ultimos and not periodo_de:
+            periodo_de = date.today() - timedelta(days=ultimos)
+
         return cls(
             cnpj=cnpj,
             cuf=obrig("EMPRESA", "cuf"),
@@ -177,11 +214,48 @@ class Config:
             pasta_controle=pasta_controle,
             pasta_planilhas=pasta_planilhas,
             servicos=servicos,
-            max_lotes=cfg.getint("LIMITES", "max_lotes_por_execucao", fallback=20),
-            pausa=cfg.getint("LIMITES", "pausa_segundos", fallback=2),
-            bloqueio_min=cfg.getint("LIMITES", "bloqueio_minutos", fallback=65),
-            timeout=cfg.getint("LIMITES", "timeout_segundos", fallback=90),
+            max_lotes=inteiro("LIMITES", "max_lotes_por_execucao", 20),
+            pausa=inteiro("LIMITES", "pausa_segundos", 2),
+            bloqueio_min=inteiro("LIMITES", "bloqueio_minutos", 65),
+            timeout=inteiro("LIMITES", "timeout_segundos", 90),
+            periodo_de=periodo_de,
+            periodo_ate=periodo_ate,
         )
+
+    def validar_periodo(self):
+        if self.periodo_de and self.periodo_ate and self.periodo_de > self.periodo_ate:
+            raise ValueError("periodo invalido: a data inicial e maior que a final")
+
+    def descricao_periodo(self):
+        if not self.periodo_de and not self.periodo_ate:
+            return "sem filtro (tudo que o ambiente nacional entregar)"
+        de = self.periodo_de.strftime("%d/%m/%Y") if self.periodo_de else "o inicio"
+        ate = self.periodo_ate.strftime("%d/%m/%Y") if self.periodo_ate else "hoje"
+        return f"de {de} ate {ate}"
+
+
+def ler_data_iso(texto):
+    """Primeira data aaaa-mm-dd encontrada no texto (ex.: campo JSON do ADN)."""
+    m = RE_DATA_ISO.search(texto or "")
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def ler_data(texto):
+    """Aceita dd/mm/aaaa, dd-mm-aaaa e aaaa-mm-dd. Vazio -> None."""
+    texto = (texto or "").strip()
+    if not texto:
+        return None
+    for formato in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
+        try:
+            return datetime.strptime(texto, formato).date()
+        except ValueError:
+            continue
+    raise ValueError(f"data invalida: {texto} (use dd/mm/aaaa)")
 
 
 def configurar_log(cfg, verboso=False):
@@ -362,8 +436,48 @@ def nome_arquivo(conteudo, prefixo, raiz=None, nsu=None, documento=True):
     return f"{base}-{raiz}-{sufixo}.xml"
 
 
-def gravar_xml(cfg, conteudo, prefixo, contadores, nsu=None):
+def data_do_documento(conteudo):
+    """Data do documento (emissao de preferencia), ou None se nao achar."""
+    try:
+        raiz = ET.fromstring(conteudo)
+    except ET.ParseError:
+        return None
+
+    achados = {}
+    for el in raiz.iter():
+        tag = el.tag.split("}")[-1]
+        if tag in TAGS_DATA and el.text and tag not in achados:
+            achados[tag] = el.text
+
+    for tag in TAGS_DATA:
+        data = ler_data_iso(achados.get(tag, ""))
+        if data:
+            return data
+    return None
+
+
+def dentro_do_periodo(cfg, data):
+    """Sem periodo configurado, tudo entra. Sem data legivel, tambem entra:
+    melhor gravar um XML a mais do que perder documento por falha de leitura."""
+    if data is None:
+        return True
+    if cfg.periodo_de and data < cfg.periodo_de:
+        return False
+    if cfg.periodo_ate and data > cfg.periodo_ate:
+        return False
+    return True
+
+
+def gravar_xml(cfg, conteudo, prefixo, contadores, nsu=None, data=None,
+               ignorar_periodo=False):
     """Grava documentos processaveis na raiz; eventos/resumos em subpasta."""
+    if not ignorar_periodo:
+        if data is None:
+            data = data_do_documento(conteudo)
+        if not dentro_do_periodo(cfg, data):
+            contadores["fora_periodo"] += 1
+            return None
+
     raiz = raiz_do_xml(conteudo)
     documento = raiz in RAIZES_DOCUMENTO
 
@@ -395,19 +509,41 @@ def descompactar_doczip(texto_b64):
 
 
 # ===================== MODULO SOAP (NF-e / CT-e) =====================
-def montar_envelope(cfg, servico, ult_nsu):
+@dataclass
+class RespostaDist:
+    """retDistDFeInt ja interpretado: docs = [(nsu, xml, data)]."""
+    cstat: str = ""
+    xmotivo: str = ""
+    ult_nsu: str = ""
+    max_nsu: str = ""
+    docs: list = field(default_factory=list)
+
+    @property
+    def datas(self):
+        return [d for _, _, d in self.docs if d]
+
+
+def montar_envelope(cfg, servico, ult_nsu=None, chave=None):
+    """distNSU para varredura; consChNFe/consChCTe para consulta avulsa."""
     if servico == "nfe":
         ns = NS_NFE
         wsdl = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe"
         metodo = "nfeDistDFeInteresse"
         tag_dados = "nfeDadosMsg"
         versao = "1.01"
+        consulta_chave = f"<consChNFe><chNFe>{chave}</chNFe></consChNFe>"
     else:
         ns = NS_CTE
         wsdl = "http://www.portalfiscal.inf.br/cte/wsdl/CTeDistribuicaoDFe"
         metodo = "cteDistDFeInteresse"
         tag_dados = "cteDadosMsg"
         versao = "1.00"
+        consulta_chave = f"<consChCTe><chCTe>{chave}</chCTe></consChCTe>"
+
+    if chave:
+        corpo = consulta_chave
+    else:
+        corpo = f"<distNSU><ultNSU>{str(ult_nsu).zfill(15)}</ultNSU></distNSU>"
 
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -419,7 +555,7 @@ def montar_envelope(cfg, servico, ult_nsu):
         f"<tpAmb>{cfg.tp_amb}</tpAmb>"
         f"<cUFAutor>{cfg.cuf}</cUFAutor>"
         f"<CNPJ>{cfg.cnpj}</CNPJ>"
-        f"<distNSU><ultNSU>{str(ult_nsu).zfill(15)}</ultNSU></distNSU>"
+        f"{corpo}"
         "</distDFeInt>"
         f"</{tag_dados}>"
         f"</{metodo}>"
@@ -428,76 +564,158 @@ def montar_envelope(cfg, servico, ult_nsu):
     )
 
 
-def rodar_soap(cfg, servico, sessao, info, contadores):
+def consultar_soap(cfg, servico, sessao, ult_nsu=None, chave=None):
+    """Uma requisicao ao DistribuicaoDFe. None quando a resposta nao veio."""
     ns = NS_NFE if servico == "nfe" else NS_CTE
     url = (URL_NFE if servico == "nfe" else URL_CTE)[cfg.tp_amb]
     action = ACTION_NFE if servico == "nfe" else ACTION_CTE
+
+    try:
+        resp = sessao.post(
+            url,
+            data=montar_envelope(cfg, servico, ult_nsu, chave).encode("utf-8"),
+            headers={
+                "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"'
+            },
+            timeout=cfg.timeout,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        log.error("    falha de rede: %s", e)
+        return None
+
+    try:
+        raiz = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        log.error("    resposta ilegivel: %s", e)
+        return None
+
+    def txt(tag):
+        el = raiz.find(f".//{{{ns}}}{tag}")
+        return el.text if el is not None and el.text else ""
+
+    resposta = RespostaDist(
+        cstat=txt("cStat"),
+        xmotivo=txt("xMotivo"),
+        ult_nsu=txt("ultNSU"),
+        max_nsu=txt("maxNSU"),
+    )
+    for doc in raiz.findall(f".//{{{ns}}}docZip"):
+        try:
+            xml = descompactar_doczip(doc.text)
+        except Exception as e:
+            log.error("    erro ao descompactar NSU %s: %s", doc.get("NSU"), e)
+            continue
+        resposta.docs.append((doc.get("NSU") or "", xml, data_do_documento(xml)))
+    return resposta
+
+
+def avancar_ate_periodo(cfg, servico, sessao, info, margem=200, max_sondagens=20):
+    """
+    Busca binaria pelo NSU onde o periodo comeca, para nao baixar os lotes
+    anteriores. O NSU cresce junto com a chegada dos documentos ao ambiente
+    nacional, entao da para sondar. A margem cobre documento autorizado com
+    atraso, que entra com NSU maior que o da sua data de emissao.
+    """
+    if not cfg.periodo_de:
+        return
+
+    atual = como_inteiro(info["ultNSU"])
+    resposta = consultar_soap(cfg, servico, sessao, atual)
+    if resposta is None:
+        return
+    if resposta.cstat == CSTAT_CONSUMO_INDEVIDO:
+        bloquear(cfg, info, f"{resposta.cstat} {resposta.xmotivo}")
+        return
+    if resposta.datas and min(resposta.datas) >= cfg.periodo_de:
+        log.info("  o NSU atual ja esta dentro do periodo; nada a pular.")
+        return
+
+    baixo, alto = atual, como_inteiro(resposta.max_nsu)
+    if alto <= baixo:
+        return
+
+    sondagens = 0
+    while alto - baixo > margem and sondagens < max_sondagens:
+        meio = (baixo + alto) // 2
+        time.sleep(cfg.pausa)
+        resposta = consultar_soap(cfg, servico, sessao, meio)
+        sondagens += 1
+        if resposta is None:
+            break
+        if resposta.cstat == CSTAT_CONSUMO_INDEVIDO:
+            bloquear(cfg, info, f"{resposta.cstat} {resposta.xmotivo}")
+            return
+
+        datas = resposta.datas
+        log.info(
+            "  sondagem NSU %s -> %s",
+            meio,
+            max(datas).strftime("%d/%m/%Y") if datas else "sem documento",
+        )
+        if datas and max(datas) < cfg.periodo_de:
+            baixo = meio
+        else:
+            alto = meio
+
+    novo = max(baixo - margem, atual)
+    if novo > atual:
+        log.info(
+            "  pulando do NSU %s para %s (%s sondagem(ns)); os documentos"
+            " anteriores nao serao baixados.", atual, novo, sondagens,
+        )
+        info["ultNSU"] = str(novo)
+    else:
+        log.info("  nao houve NSU a pular.")
+
+
+def rodar_soap(cfg, servico, sessao, info, contadores):
     prefixo = servico.upper()
 
     for lote in range(1, cfg.max_lotes + 1):
         ult = info["ultNSU"]
         log.info("  lote %s/%s a partir do NSU %s", lote, cfg.max_lotes, ult)
-        try:
-            resp = sessao.post(
-                url,
-                data=montar_envelope(cfg, servico, ult).encode("utf-8"),
-                headers={
-                    "Content-Type": f'application/soap+xml; charset=utf-8; action="{action}"'
-                },
-                timeout=cfg.timeout,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            log.error("    falha de rede: %s", e)
+
+        resposta = consultar_soap(cfg, servico, sessao, ult)
+        if resposta is None:
+            return
+        log.info(
+            "    cStat %s - %s | %s doc(s)",
+            resposta.cstat, resposta.xmotivo, len(resposta.docs),
+        )
+
+        if resposta.cstat == CSTAT_CONSUMO_INDEVIDO:
+            bloquear(cfg, info, f"{resposta.cstat} {resposta.xmotivo}")
             return
 
-        try:
-            raiz = ET.fromstring(resp.content)
-        except ET.ParseError as e:
-            log.error("    resposta ilegivel: %s", e)
-            return
-
-        def txt(tag):
-            el = raiz.find(f".//{{{ns}}}{tag}")
-            return el.text if el is not None and el.text else ""
-
-        cstat, xmotivo = txt("cStat"), txt("xMotivo")
-        novo_ult, max_nsu = txt("ultNSU"), txt("maxNSU")
-        docs = raiz.findall(f".//{{{ns}}}docZip")
-        log.info("    cStat %s - %s | %s doc(s)", cstat, xmotivo, len(docs))
-
-        if cstat == CSTAT_CONSUMO_INDEVIDO:
-            bloquear(cfg, info, f"{cstat} {xmotivo}")
-            return
-
-        for doc in docs:
+        for nsu, xml, data in resposta.docs:
             try:
-                gravar_xml(
-                    cfg,
-                    descompactar_doczip(doc.text),
-                    prefixo,
-                    contadores,
-                    nsu=doc.get("NSU"),
-                )
+                gravar_xml(cfg, xml, prefixo, contadores, nsu=nsu, data=data)
             except Exception as e:
-                log.error("    erro ao processar doc NSU %s: %s", doc.get("NSU"), e)
+                log.error("    erro ao gravar NSU %s: %s", nsu, e)
 
-        if novo_ult:
-            info["ultNSU"] = novo_ult
-        if max_nsu:
-            info["maxNSU"] = max_nsu
+        if resposta.ult_nsu:
+            info["ultNSU"] = resposta.ult_nsu
+        if resposta.max_nsu:
+            info["maxNSU"] = resposta.max_nsu
 
-        if not docs:
-            if cstat == CSTAT_NENHUM_DOCUMENTO:
+        if not resposta.docs:
+            if resposta.cstat == CSTAT_NENHUM_DOCUMENTO:
                 log.info("    nada novo, varredura concluida.")
-            elif cstat != CSTAT_DOCUMENTO_LOCALIZADO:
-                log.warning("    parando: cStat %s - %s", cstat, xmotivo)
+            elif resposta.cstat != CSTAT_DOCUMENTO_LOCALIZADO:
+                log.warning("    parando: cStat %s - %s", resposta.cstat, resposta.xmotivo)
             return
-        if como_inteiro(novo_ult) >= como_inteiro(max_nsu, -1) > 0:
+        if como_inteiro(resposta.ult_nsu) >= como_inteiro(resposta.max_nsu, -1) > 0:
             log.info("    alcancou o maxNSU, varredura concluida.")
             return
-        if como_inteiro(novo_ult) <= como_inteiro(ult):
+        if como_inteiro(resposta.ult_nsu) <= como_inteiro(ult):
             log.warning("    NSU nao avancou (%s); interrompendo para nao repetir.", ult)
+            return
+        if cfg.periodo_ate and resposta.datas and min(resposta.datas) > cfg.periodo_ate:
+            log.info(
+                "    o lote ja passou de %s; parando por aqui.",
+                cfg.periodo_ate.strftime("%d/%m/%Y"),
+            )
             return
         time.sleep(cfg.pausa)
 
@@ -557,6 +775,7 @@ def rodar_nfse(cfg, sessao, info, contadores):
             log.error("    erro ADN: %s", erro)
 
         maior_nsu = ult
+        datas = []
         for item in documentos:
             conteudo_b64 = item.get("ArquivoXml") or item.get("arquivoXml")
             nsu_item = como_inteiro(item.get("NSU") or item.get("nsu"), 0)
@@ -564,13 +783,11 @@ def rodar_nfse(cfg, sessao, info, contadores):
             if not conteudo_b64:
                 continue
             try:
-                gravar_xml(
-                    cfg,
-                    descompactar_doczip(conteudo_b64),
-                    "NFSE",
-                    contadores,
-                    nsu=nsu_item or None,
-                )
+                xml = descompactar_doczip(conteudo_b64)
+                data = data_do_documento(xml) or ler_data_iso(item.get("DataHoraGeracao"))
+                if data:
+                    datas.append(data)
+                gravar_xml(cfg, xml, "NFSE", contadores, nsu=nsu_item or None, data=data)
             except Exception as e:
                 log.error("    erro ao processar NSU %s: %s", nsu_item, e)
 
@@ -587,11 +804,150 @@ def rodar_nfse(cfg, sessao, info, contadores):
         if maior_nsu <= ult:
             log.warning("    NSU nao avancou (%s); interrompendo para nao repetir.", ult)
             return
+        if cfg.periodo_ate and datas and min(datas) > cfg.periodo_ate:
+            log.info(
+                "    o lote ja passou de %s; parando por aqui.",
+                cfg.periodo_ate.strftime("%d/%m/%Y"),
+            )
+            return
         time.sleep(cfg.pausa)
 
     log.info(
         "    limite de %s lote(s) atingido; continua na proxima execucao.", cfg.max_lotes
     )
+
+
+# ===================== CONSULTA AVULSA POR CHAVE =====================
+def servico_da_chave(chave):
+    """
+    Descobre o servico pela propria chave: 50 digitos e NFS-e; nos 44 digitos
+    o modelo esta nas posicoes 21-22 (55/65 = NF-e, 57/67 = CT-e).
+    """
+    if len(chave) == 50:
+        return "nfse"
+    if len(chave) == 44:
+        return MODELO_SERVICO.get(chave[20:22])
+    return None
+
+
+def normalizar_chaves(entradas):
+    """
+    Aceita chave crua, com espacos em grupos de 4 (como o portal mostra) ou
+    varias separadas por virgula/ponto-e-virgula/quebra de linha.
+    Devolve (chaves_validas, entradas_recusadas).
+    """
+    validas, erros = [], []
+
+    def guardar(chave):
+        if chave not in validas:
+            validas.append(chave)
+
+    texto = " ".join(str(e) for e in entradas)
+    for candidato in re.split(r"[,;\n]+", texto):
+        candidato = candidato.strip()
+        if not candidato:
+            continue
+        pedacos = candidato.split()
+
+        # Se algum pedaco ja e uma chave inteira, sao varias chaves soltas -
+        # juntar os digitos aqui poderia formar uma chave que ninguem pediu.
+        if len(pedacos) > 1 and any(servico_da_chave(re.sub(r"\D", "", p)) for p in pedacos):
+            for pedaco in pedacos:
+                digitos = re.sub(r"\D", "", pedaco)
+                if servico_da_chave(digitos):
+                    guardar(digitos)
+                else:
+                    erros.append(pedaco)
+            continue
+
+        # Senao, e uma chave so - possivelmente em grupos de 4 digitos
+        digitos = re.sub(r"\D", "", candidato)
+        if servico_da_chave(digitos):
+            guardar(digitos)
+        else:
+            erros.append(candidato if len(candidato) <= 60 else candidato[:57] + "...")
+
+    return validas, erros
+
+
+def baixar_nfse_por_chave(cfg, sessao, chave, contadores):
+    """Sefin Nacional: GET /nfse/{chave} devolve o XML em base64/gzip."""
+    url = f"{URL_SEFIN_NFSE[cfg.tp_amb]}/nfse/{chave}"
+    try:
+        resp = sessao.get(url, headers={"Accept": "application/json"}, timeout=cfg.timeout)
+    except Exception as e:
+        log.error("    falha de rede: %s", e)
+        return False
+
+    if resp.status_code == 404:
+        log.warning("    nao encontrada no Sefin Nacional.")
+        return False
+    if resp.status_code >= 400:
+        log.error("    HTTP %s: %s", resp.status_code, resp.text[:300])
+        return False
+
+    try:
+        dados = resp.json()
+    except ValueError:
+        log.error("    resposta nao-JSON: %s", resp.text[:300])
+        return False
+
+    bruto = dados.get("nfseXmlGZipB64") or dados.get("NfseXmlGZipB64")
+    if bruto:
+        xml = descompactar_doczip(bruto)
+    else:
+        xml = dados.get("xmlNFSe") or dados.get("xml") or ""
+        if not xml.lstrip().startswith("<"):
+            log.warning("    resposta sem XML da NFS-e.")
+            return False
+
+    destino = gravar_xml(cfg, xml, "NFSE", contadores, ignorar_periodo=True)
+    log.info("    %s", destino.name if destino else "ja estava na pasta.")
+    return True
+
+
+def baixar_soap_por_chave(cfg, servico, sessao, chave, contadores):
+    resposta = consultar_soap(cfg, servico, sessao, chave=chave)
+    if resposta is None:
+        return False
+    log.info("    cStat %s - %s", resposta.cstat, resposta.xmotivo)
+
+    if resposta.cstat == CSTAT_CONSUMO_INDEVIDO:
+        log.error("    consumo indevido: aguarde ~1h antes de repetir a consulta.")
+        return False
+    if not resposta.docs:
+        log.warning("    nada devolvido (o CNPJ do certificado e parte na nota?).")
+        return False
+
+    for nsu, xml, _ in resposta.docs:
+        destino = gravar_xml(cfg, xml, servico.upper(), contadores,
+                             nsu=nsu, ignorar_periodo=True)
+        log.info("    %s", destino.name if destino else "ja estava na pasta.")
+    return True
+
+
+def baixar_por_chave(cfg, sessao, chaves, contadores):
+    """Baixa documentos avulsos, sem mexer no NSU nem no filtro de periodo."""
+    rotulos = {"nfe": "NF-e", "cte": "CT-e", "nfse": "NFS-e"}
+    achados = 0
+
+    for i, chave in enumerate(chaves, 1):
+        servico = servico_da_chave(chave)
+        log.info("\n[%s/%s] %s %s", i, len(chaves), rotulos[servico], chave)
+        try:
+            if servico == "nfse":
+                ok = baixar_nfse_por_chave(cfg, sessao, chave, contadores)
+            else:
+                ok = baixar_soap_por_chave(cfg, servico, sessao, chave, contadores)
+        except Exception as e:
+            log.exception("    erro inesperado: %s", e)
+            ok = False
+        achados += bool(ok)
+        if i < len(chaves):
+            time.sleep(cfg.pausa)
+
+    log.info("\n---\n%s de %s chave(s) atendida(s).", achados, len(chaves))
+    return achados
 
 
 # ===================== CONFERENCIA COM A PLANILHA =====================
@@ -665,6 +1021,18 @@ def montar_argumentos(argv=None):
                    help=f"limita a varredura ({', '.join(SERVICOS)})")
     p.add_argument("--nsu", type=int,
                    help="forca o NSU inicial (exige um unico --servico)")
+    p.add_argument("--chave", nargs="+", metavar="CHAVE",
+                   help=f"baixa ate {MAX_CHAVES} documentos por chave de acesso "
+                        "(NF-e, CT-e ou NFS-e) e sai; nao mexe no NSU")
+    p.add_argument("--de", metavar="DATA",
+                   help="so grava documentos a partir desta data (dd/mm/aaaa)")
+    p.add_argument("--ate", metavar="DATA",
+                   help="so grava documentos ate esta data (dd/mm/aaaa)")
+    p.add_argument("--ultimos", type=int, metavar="DIAS",
+                   help="atalho para --de = hoje menos DIAS")
+    p.add_argument("--pular-anteriores", action="store_true",
+                   help="sonda o NSU onde o periodo comeca e pula os lotes "
+                        "anteriores (NF-e/CT-e); os antigos nao serao baixados")
     p.add_argument("--max-lotes", type=int, help="sobrepoe o limite do config.ini")
     p.add_argument("--ignorar-bloqueio", action="store_true",
                    help="ignora o bloqueio gravado no estado (cuidado com o 656)")
@@ -707,17 +1075,41 @@ def main(argv=None):
     if args.max_lotes:
         cfg.max_lotes = args.max_lotes
 
+    try:
+        if args.de:
+            cfg.periodo_de = ler_data(args.de)
+        if args.ate:
+            cfg.periodo_ate = ler_data(args.ate)
+        if args.ultimos:
+            cfg.periodo_de = date.today() - timedelta(days=args.ultimos)
+        cfg.validar_periodo()
+    except ValueError as e:
+        print(f"ERRO: {e}")
+        return 1
+
     configurar_log(cfg, args.verbose)
 
     if args.status:
         mostrar_status(cfg)
+        log.info("Periodo configurado: %s", cfg.descricao_periodo())
         return 0
+
+    chaves = erros_chave = None
+    if args.chave:
+        chaves, erros_chave = normalizar_chaves(args.chave)
+        for ruim in erros_chave:
+            print(f"chave invalida (esperado 44 ou 50 digitos): {ruim}")
+        if not chaves:
+            return 1
+        if len(chaves) > MAX_CHAVES:
+            print(f"informe no maximo {MAX_CHAVES} chaves por vez ({len(chaves)} recebidas)")
+            return 1
 
     escolhidos = args.servico or [s for s in SERVICOS if cfg.servicos.get(s)]
     if args.nsu is not None and len(escolhidos) != 1:
         print("--nsu exige exatamente um --servico")
         return 1
-    if not escolhidos:
+    if not chaves and not escolhidos:
         log.info("Nenhum servico ativo no config.ini.")
         return 0
 
@@ -736,8 +1128,16 @@ def main(argv=None):
             return 1
 
         sessao = nova_sessao((pem_cert, pem_key))
+        contadores = {"documentos": 0, "eventos": 0, "duplicados": 0, "fora_periodo": 0}
+
+        if chaves:
+            log.info("Consulta avulsa de %s chave(s).", len(chaves))
+            baixar_por_chave(cfg, sessao, chaves, contadores)
+            log.info("Pasta de saida: %s", cfg.pasta_saida)
+            return 0
+
         estado = carregar_estado(cfg)
-        contadores = {"documentos": 0, "eventos": 0, "duplicados": 0}
+        log.info("Periodo: %s", cfg.descricao_periodo())
 
         rotulos = {"nfe": "NF-e", "cte": "CT-e", "nfse": "NFS-e"}
         executores = {
@@ -763,6 +1163,18 @@ def main(argv=None):
             info.pop("motivo_bloqueio", None)
 
             try:
+                if args.pular_anteriores and servico in ("nfe", "cte"):
+                    avancar_ate_periodo(cfg, servico, sessao, info)
+                    salvar_estado(cfg, estado)
+                    if bloqueado(info):
+                        continue
+                elif args.pular_anteriores:
+                    log.info("  --pular-anteriores nao vale para NFS-e (o ADN nao"
+                             " informa o maxNSU); a varredura segue normal.")
+                elif cfg.periodo_de and como_inteiro(info["ultNSU"]) == 0:
+                    log.info("  dica: --pular-anteriores evita baixar os lotes"
+                             " anteriores a %s.", cfg.periodo_de.strftime("%d/%m/%Y"))
+
                 executores[servico](info, contadores)
             except Exception as e:
                 log.exception("  erro inesperado: %s", e)
@@ -771,8 +1183,10 @@ def main(argv=None):
 
         salvar_estado(cfg, estado)
         log.info(
-            "\n---\nDocumentos gravados: %s | eventos/resumos: %s | ja existentes: %s",
-            contadores["documentos"], contadores["eventos"], contadores["duplicados"],
+            "\n---\nDocumentos gravados: %s | eventos/resumos: %s | ja existentes: %s"
+            " | fora do periodo: %s",
+            contadores["documentos"], contadores["eventos"],
+            contadores["duplicados"], contadores["fora_periodo"],
         )
         log.info("Pasta de saida: %s", cfg.pasta_saida)
 

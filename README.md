@@ -31,9 +31,70 @@ python baixador.py --servico nfe cte      # só NF-e e CT-e
 python baixador.py --status               # mostra NSU/bloqueios e sai
 python baixador.py --servico nfse --nsu 0 # reprocessa a NFS-e do começo
 python baixador.py --max-lotes 5 -v       # execução curta, log detalhado
+python baixador.py --ultimos 30           # só os últimos 30 dias
+python baixador.py --chave 2925...2349    # uma nota específica
 ```
 
 Outras opções: `--config CAMINHO`, `--sem-conferencia`, `--ignorar-bloqueio`.
+
+## Escolher um período (em vez dos 90 dias)
+
+**As três APIs paginam por NSU e nenhuma aceita filtro por data.** Não existe
+"me dê só julho" — o que o script faz é: grava apenas o que está no período e
+pula o resto.
+
+```bash
+python baixador.py --de 01/07/2026 --ate 31/07/2026
+python baixador.py --ultimos 15                       # janela móvel
+```
+
+Também dá para fixar no `config.ini`, seção `[PERIODO]` (`de`, `ate` ou
+`ultimos_dias`), útil para execução agendada. A linha de comando tem preferência.
+
+Com o período definido, a varredura ainda passa pelos lotes anteriores — só não
+grava o que está fora. Para **não baixar** os lotes antigos, use:
+
+```bash
+python baixador.py --de 01/07/2026 --pular-anteriores
+```
+
+O `--pular-anteriores` faz uma busca binária (~10 a 15 requisições) pelo NSU em
+que o período começa e salta direto para lá, com uma margem de 200 NSUs para
+trás por causa de nota autorizada com atraso. Vale para NF-e e CT-e; a NFS-e não
+tem como, porque o ADN não informa o `maxNSU`.
+
+Dois avisos:
+
+- Os documentos pulados **não voltam** nas próximas execuções, porque o ponteiro
+  de NSU avança. Para buscá-los depois: `--servico nfe --nsu 0`.
+- O filtro vale para nota **e** evento, cada um pela sua própria data. Um
+  cancelamento de agosto referente a uma nota de julho fica de fora de
+  `--ate 31/07`.
+
+Documento cuja data não dá para ler é sempre gravado — melhor um XML a mais do
+que perder nota por falha de leitura.
+
+## Baixar documentos avulsos por chave
+
+Até 10 chaves por execução, misturando os três tipos. O script identifica
+sozinho o que é cada uma (modelo 55/65 = NF-e, 57/67 = CT-e, 50 dígitos = NFS-e):
+
+```bash
+python baixador.py --chave 29250712345678000199550010000012341000012349
+python baixador.py --chave CHAVE_NFE CHAVE_CTE CHAVE_NFSE
+python baixador.py --chave "2925 0712 3456 7800 0199 5500 1000 0012 3410 0001 2349"
+```
+
+Aceita chave crua, colada do portal em grupos de 4, ou várias separadas por
+espaço, vírgula ou quebra de linha. Nesse modo o script **não mexe no NSU** e
+**ignora o filtro de período** — você pediu aquela nota, ela é gravada.
+
+Por baixo: NF-e e CT-e vão por `consChNFe`/`consChCTe` no mesmo
+`DistribuicaoDFe`; NFS-e vai no Sefin Nacional (`GET /nfse/{chave}`).
+
+Limitação da SEFAZ: a consulta por chave só devolve o XML se o CNPJ do
+certificado for parte interessada no documento (destinatário, tomador…). Para
+nota de terceiro vem `cStat 137` sem documento.
 
 Para rodar sozinho, agende `python baixador.py` no Agendador de Tarefas
 (Windows) ou no cron a cada 1–2 horas. Um arquivo de lock impede que duas

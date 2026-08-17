@@ -10,6 +10,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import baixador as b
@@ -20,10 +21,11 @@ CHAVE_CTE = "29250712345678000199570010000055551000055559"[:44].ljust(44, "0")
 CHAVE_NFSE = "3".ljust(50, "7")
 
 
-def nfe_proc(chave=CHAVE_NFE):
+def nfe_proc(chave=CHAVE_NFE, dh_emi="2026-07-15T10:20:30-03:00"):
     return (
         '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">'
-        f'<NFe><infNFe Id="NFe{chave}" versao="4.00"><ide><nNF>123</nNF></ide></infNFe></NFe>'
+        f'<NFe><infNFe Id="NFe{chave}" versao="4.00">'
+        f"<ide><nNF>123</nNF><dhEmi>{dh_emi}</dhEmi></ide></infNFe></NFe>"
         "</nfeProc>"
     )
 
@@ -33,6 +35,14 @@ def evento_nfe(chave=CHAVE_NFE, seq="1"):
         '<procEventoNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00">'
         f'<evento><infEvento Id="ID110111{chave}0{seq}"><chNFe>{chave}</chNFe>'
         f"<nSeqEvento>{seq}</nSeqEvento></infEvento></evento></procEventoNFe>"
+    )
+
+
+def cte_proc(chave=CHAVE_CTE, dh_emi="2026-07-16T08:00:00-03:00"):
+    return (
+        '<cteProc xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00">'
+        f'<CTe><infCte Id="CTe{chave}"><ide><dhEmi>{dh_emi}</dhEmi></ide></infCte></CTe>'
+        "</cteProc>"
     )
 
 
@@ -125,7 +135,8 @@ class BaseTemp(unittest.TestCase):
         )
         self.cfg.pasta_saida.mkdir(parents=True)
         self.cfg.pasta_controle.mkdir(parents=True)
-        self.contadores = {"documentos": 0, "eventos": 0, "duplicados": 0}
+        self.contadores = {"documentos": 0, "eventos": 0, "duplicados": 0,
+                           "fora_periodo": 0}
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -359,6 +370,219 @@ class TestEstadoELock(BaseTemp):
         self.assertTrue(b.adquirir_lock(self.cfg))
 
 
+class TestPeriodo(BaseTemp):
+    def test_le_formatos_de_data(self):
+        self.assertEqual(b.ler_data("15/07/2026"), date(2026, 7, 15))
+        self.assertEqual(b.ler_data("2026-07-15"), date(2026, 7, 15))
+        self.assertEqual(b.ler_data("15-07-2026"), date(2026, 7, 15))
+        self.assertIsNone(b.ler_data("  "))
+        with self.assertRaises(ValueError):
+            b.ler_data("31/31/2026")
+
+    def test_data_do_documento_prefere_emissao(self):
+        self.assertEqual(b.data_do_documento(nfe_proc()), date(2026, 7, 15))
+
+    def test_data_de_evento(self):
+        xml = evento_nfe().replace(
+            "<nSeqEvento>1</nSeqEvento>",
+            "<nSeqEvento>1</nSeqEvento><dhEvento>2026-08-02T09:00:00-03:00</dhEvento>",
+        )
+        self.assertEqual(b.data_do_documento(xml), date(2026, 8, 2))
+
+    def test_documento_sem_data_nao_estoura(self):
+        self.assertIsNone(b.data_do_documento("<resNFe><chNFe>1</chNFe></resNFe>"))
+
+    def test_periodo_invalido_reclama(self):
+        self.cfg.periodo_de = date(2026, 8, 1)
+        self.cfg.periodo_ate = date(2026, 7, 1)
+        with self.assertRaises(ValueError):
+            self.cfg.validar_periodo()
+
+    def test_grava_so_o_que_esta_no_periodo(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        self.cfg.periodo_ate = date(2026, 7, 31)
+
+        dentro = nfe_proc(CHAVE_NFE, "2026-07-15T10:00:00-03:00")
+        antes = nfe_proc("1".ljust(44, "3"), "2026-06-20T10:00:00-03:00")
+        depois = nfe_proc("2".ljust(44, "4"), "2026-08-05T10:00:00-03:00")
+
+        self.assertIsNotNone(b.gravar_xml(self.cfg, dentro, "NFE", self.contadores))
+        self.assertIsNone(b.gravar_xml(self.cfg, antes, "NFE", self.contadores))
+        self.assertIsNone(b.gravar_xml(self.cfg, depois, "NFE", self.contadores))
+
+        self.assertEqual(self.contadores["documentos"], 1)
+        self.assertEqual(self.contadores["fora_periodo"], 2)
+        self.assertEqual(len(list(self.cfg.pasta_saida.glob("*.xml"))), 1)
+
+    def test_documento_sem_data_e_gravado(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        self.assertIsNotNone(b.gravar_xml(self.cfg, resumo_nfe(), "NFE", self.contadores))
+
+    def test_consulta_por_chave_ignora_o_periodo(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        antiga = nfe_proc(CHAVE_NFE, "2020-01-01T10:00:00-03:00")
+        self.assertIsNotNone(
+            b.gravar_xml(self.cfg, antiga, "NFE", self.contadores, ignorar_periodo=True)
+        )
+
+    def test_varredura_para_ao_passar_da_data_final(self):
+        self.cfg.periodo_ate = date(2026, 7, 31)
+        sessao = SessaoFalsa([
+            RespostaFalsa(envelope_resposta(
+                b.NS_NFE, "138", 1, 999,
+                [(1, nfe_proc(CHAVE_NFE, "2026-08-10T10:00:00-03:00"))])),
+        ])
+        info = {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None}
+        b.rodar_soap(self.cfg, "nfe", sessao, info, self.contadores)
+        self.assertEqual(len(sessao.chamadas), 1)
+        self.assertEqual(self.contadores["fora_periodo"], 1)
+
+
+class TestAvancarNsu(BaseTemp):
+    """Busca binaria do NSU onde o periodo comeca."""
+
+    def resposta(self, nsu_base, dia, maximo=10000):
+        return RespostaFalsa(envelope_resposta(
+            b.NS_NFE, "138", nsu_base + 1, maximo,
+            [(nsu_base + 1, nfe_proc(CHAVE_NFE, f"{dia}T10:00:00-03:00"))],
+        ))
+
+    def test_pula_para_perto_do_inicio_do_periodo(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        # NSU 0..5000 = junho; acima disso, julho
+        def para(nsu):
+            return "2026-06-15" if nsu < 5000 else "2026-07-10"
+
+        class SessaoCalendario(SessaoFalsa):
+            def post(self, url, **kwargs):
+                self.chamadas.append((url, kwargs))
+                corpo = kwargs["data"].decode()
+                nsu = int(corpo.split("<ultNSU>")[1].split("</ultNSU>")[0])
+                return RespostaFalsa(envelope_resposta(
+                    b.NS_NFE, "138", nsu + 1, 10000,
+                    [(nsu + 1, nfe_proc(CHAVE_NFE, f"{para(nsu)}T10:00:00-03:00"))],
+                ))
+
+        sessao = SessaoCalendario([])
+        info = {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None}
+        b.avancar_ate_periodo(self.cfg, "nfe", sessao, info, margem=100)
+
+        avancado = int(info["ultNSU"])
+        self.assertGreater(avancado, 4000)
+        self.assertLess(avancado, 5000)   # ficou antes do inicio, com margem
+        self.assertLess(len(sessao.chamadas), 20)
+
+    def test_nao_pula_quando_ja_esta_no_periodo(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        sessao = SessaoFalsa([self.resposta(100, "2026-07-20")])
+        info = {"ultNSU": "100", "maxNSU": "10000", "bloqueado_ate": None}
+        b.avancar_ate_periodo(self.cfg, "nfe", sessao, info)
+        self.assertEqual(info["ultNSU"], "100")
+        self.assertEqual(len(sessao.chamadas), 1)
+
+    def test_sem_periodo_nao_faz_requisicao(self):
+        sessao = SessaoFalsa([])
+        info = {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None}
+        b.avancar_ate_periodo(self.cfg, "nfe", sessao, info)
+        self.assertEqual(sessao.chamadas, [])
+
+    def test_consumo_indevido_durante_a_sondagem_bloqueia(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        sessao = SessaoFalsa([RespostaFalsa(envelope_resposta(b.NS_NFE, "656", 0, 0))])
+        info = {"ultNSU": "0", "maxNSU": "0", "bloqueado_ate": None}
+        b.avancar_ate_periodo(self.cfg, "nfe", sessao, info)
+        self.assertIsNotNone(b.bloqueado(info))
+        self.assertEqual(info["ultNSU"], "0")
+
+
+class TestChaves(BaseTemp):
+    def test_identifica_o_servico_pelo_modelo(self):
+        self.assertEqual(b.servico_da_chave(CHAVE_NFE), "nfe")     # modelo 55
+        self.assertEqual(b.servico_da_chave(CHAVE_CTE), "cte")     # modelo 57
+        self.assertEqual(b.servico_da_chave(CHAVE_NFSE), "nfse")   # 50 digitos
+        self.assertIsNone(b.servico_da_chave("123"))
+
+    def test_aceita_chave_com_espacos_do_portal(self):
+        espacada = " ".join(CHAVE_NFE[i:i + 4] for i in range(0, 44, 4))
+        validas, erros = b.normalizar_chaves([espacada])
+        self.assertEqual(validas, [CHAVE_NFE])
+        self.assertEqual(erros, [])
+
+    def test_aceita_varias_separadas_por_virgula_e_ignora_repetida(self):
+        validas, erros = b.normalizar_chaves([f"{CHAVE_NFE}, {CHAVE_CTE};{CHAVE_NFE}"])
+        self.assertEqual(validas, [CHAVE_NFE, CHAVE_CTE])
+        self.assertEqual(erros, [])
+
+    def test_aceita_varias_separadas_por_espaco(self):
+        validas, _ = b.normalizar_chaves([CHAVE_NFE, CHAVE_CTE])
+        self.assertEqual(validas, [CHAVE_NFE, CHAVE_CTE])
+
+    def test_recusa_chave_incompleta(self):
+        validas, erros = b.normalizar_chaves(["123456", CHAVE_NFE])
+        self.assertEqual(validas, [CHAVE_NFE])
+        self.assertEqual(erros, ["123456"])
+
+    def test_envelope_de_consulta_por_chave(self):
+        env = b.montar_envelope(self.cfg, "nfe", chave=CHAVE_NFE)
+        self.assertIn(f"<consChNFe><chNFe>{CHAVE_NFE}</chNFe></consChNFe>", env)
+        self.assertNotIn("distNSU", env)
+
+        env_cte = b.montar_envelope(self.cfg, "cte", chave=CHAVE_CTE)
+        self.assertIn(f"<consChCTe><chCTe>{CHAVE_CTE}</chCTe></consChCTe>", env_cte)
+
+    def test_baixa_nfe_e_cte_por_chave(self):
+        sessao = SessaoFalsa([
+            RespostaFalsa(envelope_resposta(b.NS_NFE, "138", 0, 0, [(1, nfe_proc())])),
+            RespostaFalsa(envelope_resposta(b.NS_CTE, "138", 0, 0, [(2, cte_proc())])),
+        ])
+        atendidas = b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFE, CHAVE_CTE], self.contadores)
+        self.assertEqual(atendidas, 2)
+        self.assertEqual(self.contadores["documentos"], 2)
+
+    def test_chave_fora_do_periodo_ainda_e_baixada(self):
+        self.cfg.periodo_de = date(2026, 7, 1)
+        antiga = nfe_proc(CHAVE_NFE, "2019-01-01T10:00:00-03:00")
+        sessao = SessaoFalsa([
+            RespostaFalsa(envelope_resposta(b.NS_NFE, "138", 0, 0, [(1, antiga)])),
+        ])
+        b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFE], self.contadores)
+        self.assertEqual(self.contadores["documentos"], 1)
+        self.assertEqual(self.contadores["fora_periodo"], 0)
+
+    def test_nfe_nao_encontrada_nao_conta(self):
+        sessao = SessaoFalsa([RespostaFalsa(envelope_resposta(b.NS_NFE, "137", 0, 0))])
+        atendidas = b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFE], self.contadores)
+        self.assertEqual(atendidas, 0)
+        self.assertEqual(self.contadores["documentos"], 0)
+
+    def test_baixa_nfse_pelo_sefin(self):
+        sessao = SessaoFalsa([
+            RespostaFalsa(status_code=200, json_data={"nfseXmlGZipB64": zipar(nfse_proc())}),
+        ])
+        atendidas = b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFSE], self.contadores)
+
+        url, _ = sessao.chamadas[0]
+        self.assertEqual(
+            url, f"https://sefin.nfse.gov.br/SefinNacional/nfse/{CHAVE_NFSE}"
+        )
+        self.assertEqual(atendidas, 1)
+        self.assertTrue((self.cfg.pasta_saida / f"{CHAVE_NFSE}.xml").exists())
+
+    def test_nfse_com_xml_inline(self):
+        sessao = SessaoFalsa([
+            RespostaFalsa(status_code=200, json_data={"xmlNFSe": nfse_proc()}),
+        ])
+        self.assertEqual(
+            b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFSE], self.contadores), 1
+        )
+
+    def test_nfse_inexistente_devolve_zero(self):
+        sessao = SessaoFalsa([RespostaFalsa(status_code=404)])
+        self.assertEqual(
+            b.baixar_por_chave(self.cfg, sessao, [CHAVE_NFSE], self.contadores), 0
+        )
+
+
 class TestConferencia(BaseTemp):
     def planilha(self, chaves):
         from openpyxl import Workbook
@@ -492,6 +716,28 @@ class TestConfig(BaseTemp):
     def test_pasta_obrigatoria_reclama(self):
         with self.assertRaises(ValueError):
             b.Config.de_arquivo(self.escrever(self.base_ini(saida="")))
+
+    def test_opcao_numerica_vazia_usa_o_padrao(self):
+        ini = self.base_ini() + "[PERIODO]\nde =\nate =\nultimos_dias =\n"
+        cfg = b.Config.de_arquivo(self.escrever(ini))
+        self.assertIsNone(cfg.periodo_de)
+        self.assertIsNone(cfg.periodo_ate)
+
+    def test_opcao_numerica_invalida_reclama(self):
+        ini = self.base_ini() + "[PERIODO]\nultimos_dias = trinta\n"
+        with self.assertRaises(ValueError):
+            b.Config.de_arquivo(self.escrever(ini))
+
+    def test_periodo_vindo_do_config(self):
+        ini = self.base_ini() + "[PERIODO]\nde = 01/07/2026\nate = 31/07/2026\n"
+        cfg = b.Config.de_arquivo(self.escrever(ini))
+        self.assertEqual(cfg.periodo_de, date(2026, 7, 1))
+        self.assertEqual(cfg.periodo_ate, date(2026, 7, 31))
+
+    def test_ultimos_dias_vira_data_inicial(self):
+        ini = self.base_ini() + "[PERIODO]\nultimos_dias = 10\n"
+        cfg = b.Config.de_arquivo(self.escrever(ini))
+        self.assertEqual(cfg.periodo_de, date.today() - b.timedelta(days=10))
 
     def test_exemplo_do_repositorio_e_valido(self):
         exemplo = Path(__file__).parent / "config.ini.exemplo"
