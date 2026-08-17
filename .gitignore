@@ -1,0 +1,15 @@
+config.ini
+*.pfx
+*.p12
+*.pem
+estado_nsu.json
+baixador.lock
+baixador.log
+relatorio_faltantes.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec

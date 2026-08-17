@@ -1,0 +1,40 @@
+; Copie este arquivo para config.ini (ao lado do baixador.py) e ajuste.
+; O config.ini contem a senha do certificado - nao versione (ja esta no .gitignore).
+
+[EMPRESA]
+; CNPJ do destinatario/tomador (so os digitos ou com mascara, tanto faz)
+cnpj = 00000000000000
+; Codigo IBGE da UF do autor da consulta (ex.: 29 BA, 35 SP, 31 MG, 33 RJ, 41 PR)
+cuf = 29
+; 1 = producao, 2 = homologacao/producao restrita
+ambiente = 1
+
+[CERTIFICADO]
+; Certificado digital A1 (.pfx / .p12)
+pfx = C:\certificados\empresa.pfx
+senha = senha-do-certificado
+
+[PASTAS]
+; Onde os XMLs sao gravados (pode ser OneDrive/rede)
+saida = C:\Fiscal\XMLs
+; Estado (ultNSU, bloqueios, log). Use disco local - NUNCA OneDrive:
+; a sincronizacao corrompe o controle de NSU se duas maquinas rodarem juntas.
+controle = C:\Fiscal\controle
+; Opcional: planilhas .xlsx com a coluna "Chave" para conferir o que faltou
+planilhas = C:\Fiscal\planilhas
+
+[SERVICOS]
+; sim / nao por servico
+nfe = sim
+cte = sim
+nfse = sim
+
+[LIMITES]
+; Lotes por execucao e por servico. A SEFAZ devolve ate 50 documentos por lote.
+max_lotes_por_execucao = 20
+; Pausa entre lotes, em segundos (evita o cStat 656 - consumo indevido)
+pausa_segundos = 2
+; Quanto tempo respeitar o bloqueio apos um 656/429
+bloqueio_minutos = 65
+; Timeout de cada requisicao, em segundos
+timeout_segundos = 90
