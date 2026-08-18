@@ -255,6 +255,30 @@ cada vencimento:
 Se duas notas diferentes gerarem o mesmo nome, a segunda vira `... [2].pdf` —
 nenhum arquivo é sobrescrito.
 
+### Reprocessar PDFs que já estão em pasta
+
+Nota que você mandou para `_PENDENTES` (botão **Pular**) fica presa lá: o XML
+já foi apagado. Para trazê-las de volta à fila **sem rebaixar XML nenhum**, dois
+cliques em `REPROCESSAR PENDENTES.BAT`, ou:
+
+```bat
+python contas.py --reprocessar                   ← lê a pasta _PENDENTES
+python contas.py --reprocessar "C:\caminho\qualquer"  ← outra pasta de PDFs
+```
+
+Ele lê cada PDF e tira dali o que precisa:
+
+- **chave de acesso**, que vem impressa no documento — daí saem o número e o
+  CNPJ do emitente, e o dígito verificador é conferido para não pegar número
+  errado de um campo vizinho;
+- **razão social do emitente**, do texto;
+- **vencimento**, quando está impresso ("Vencimento: 10/08/2026").
+
+Quem tem vencimento impresso é arquivado direto; o resto abre na janela de
+revisão, com zoom e o campo de parcelas. Depois de arquivado, o PDF sai da pasta
+de origem — quem você **Pular** de novo fica onde está. PDF corrompido é avisado
+e deixado quieto.
+
 ### Renomear o que já foi arquivado antes
 
 Os PDFs arquivados antes desta mudança estão nomeados pela chave de acesso. Para
