@@ -352,6 +352,212 @@ class TestRenomearExistentes(unittest.TestCase):
     def test_pasta_inexistente_nao_estoura(self):
         self.assertEqual(c.renomear_existentes(self.tmp / "nao_existe"), [])
 
+    def test_pela_linha_de_comando(self):
+        """Como o usuario roda: python contas.py --renomear --aplicar"""
+        import sys
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+
+        originais = (c.PASTA_DESTINO, c.ARQUIVO_PREFERENCIAS, sys.argv)
+        c.PASTA_DESTINO = self.tmp
+        c.ARQUIVO_PREFERENCIAS = self.tmp / "preferencias_contas.json"
+        try:
+            sys.argv = ["contas.py", "--renomear"]          # previa
+            c.main()
+            self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+
+            sys.argv = ["contas.py", "--renomear", "--aplicar"]
+            c.main()
+            self.assertEqual(self.nomes(), ["DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf"])
+
+            sys.argv = ["contas.py", "--desfazer-renomear"]
+            c.main()
+            self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+        finally:
+            c.PASTA_DESTINO, c.ARQUIVO_PREFERENCIAS, sys.argv = originais
+
+    def test_pastas_vem_do_json_e_sobrevivem_a_atualizacao(self):
+        originais = (c.PASTA_ORIGEM, c.PASTA_DESTINO, c.ARQUIVO_LOG,
+                     c.PASTA_PENDENTES, c.PASTA_A_VISTA)
+        try:
+            c.aplicar_pastas_das_preferencias({
+                "pasta_origem": str(self.tmp / "entrada"),
+                "pasta_destino": str(self.tmp / "destino"),
+            })
+            self.assertEqual(c.PASTA_ORIGEM, self.tmp / "entrada")
+            self.assertEqual(c.PASTA_DESTINO, self.tmp / "destino")
+            self.assertEqual(c.PASTA_PENDENTES, self.tmp / "destino" / "_PENDENTES")
+            self.assertEqual(
+                c.ARQUIVO_LOG, self.tmp / "destino" / "_log_classificacao.csv"
+            )
+        finally:
+            (c.PASTA_ORIGEM, c.PASTA_DESTINO, c.ARQUIVO_LOG,
+             c.PASTA_PENDENTES, c.PASTA_A_VISTA) = originais
+
+    def test_json_sem_pastas_nao_mexe_nos_padroes(self):
+        antes = (c.PASTA_ORIGEM, c.PASTA_DESTINO)
+        c.aplicar_pastas_das_preferencias({"prazo_cte_dias": 28})
+        self.assertEqual((c.PASTA_ORIGEM, c.PASTA_DESTINO), antes)
+
+
+class TestReprocessarPdfs(unittest.TestCase):
+    """PDFs que ficaram em _PENDENTES: o XML nao existe mais, so o PDF."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pendentes = self.tmp / "_PENDENTES"
+        self.pendentes.mkdir(parents=True)
+
+        self.originais = (c.PASTA_DESTINO, c.PASTA_PENDENTES, c.PASTA_A_VISTA,
+                          c.ARQUIVO_LOG, c.RevisorApp)
+        c.PASTA_DESTINO = self.tmp
+        c.PASTA_PENDENTES = self.pendentes
+        c.PASTA_A_VISTA = self.tmp / "_A_VISTA_SEM_VENCIMENTO"
+        c.ARQUIVO_LOG = self.tmp / "_log_classificacao.csv"
+        c.RevisorApp = lambda fila, callback: self.fail("nao deveria abrir a janela")
+
+    def tearDown(self):
+        (c.PASTA_DESTINO, c.PASTA_PENDENTES, c.PASTA_A_VISTA,
+         c.ARQUIVO_LOG, c.RevisorApp) = self.originais
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pdf_com_texto(self, nome, linhas, pasta=None):
+        from reportlab.pdfgen import canvas as rl
+        destino = (pasta or self.pendentes) / nome
+        pdf = rl.Canvas(str(destino))
+        y = 800
+        for linha in linhas:
+            pdf.drawString(40, y, linha)
+            y -= 16
+        pdf.showPage()
+        pdf.save()
+        return destino
+
+    def danfe_real(self, nome):
+        from brazilfiscalreport.danfe import Danfe
+        destino = self.pendentes / nome
+        Danfe(xml=nfe_completa()).output(str(destino))
+        return destino
+
+    def arquivados(self):
+        """So o que saiu de _PENDENTES e foi parar numa pasta de vencimento."""
+        return sorted(
+            str(p.relative_to(self.tmp)) for p in self.tmp.rglob("*.pdf")
+            if self.pendentes not in p.parents
+        )
+
+    def test_le_a_chave_impressa_no_danfe(self):
+        caminho = self.danfe_real("qualquer_nome.pdf")
+        texto = c.texto_do_pdf(caminho)
+        # no DANFE a chave sai em grupos de 4 digitos
+        self.assertEqual(c.chave_do_pdf(texto), CHAVE_NFE_REAL)
+
+    def test_tipo_sai_do_modelo_da_chave(self):
+        self.assertEqual(c.tipo_pela_chave(CHAVE_NFE_REAL), "NFe")     # modelo 55
+        self.assertEqual(c.tipo_pela_chave(CHAVE_CTE), "CTe")          # modelo 57
+        self.assertEqual(c.tipo_pela_chave("3" * 50), "NFSe")
+        self.assertEqual(c.tipo_pela_chave(None), "DESCONHECIDO")
+
+    def test_monta_o_item_a_partir_do_pdf(self):
+        item = c.item_de_pdf(self.danfe_real("sem_nome_util.pdf"))
+        self.assertEqual(item["chave"], CHAVE_NFE_REAL)
+        self.assertEqual(item["tipo"], "NFe")
+        self.assertEqual(item["nome_base"], "DISTRIBUIDORA EXEMPLO LTDA - 4521")
+
+    def test_arquiva_pelo_vencimento_impresso(self):
+        self.pdf_com_texto("nota.pdf", [
+            "DACTE - CONHECIMENTO DE TRANSPORTE",
+            "TRANSPORTES BONS LTDA",
+            "Chave de acesso 2925 0712 3456 7800 0199 5700 1000 0055 5510 0005 5559",
+            "Vencimento: 10/08/2026",
+        ])
+
+        c.reprocessar_pdfs(self.pendentes)
+
+        self.assertEqual(self.arquivados(), [
+            str(Path("2026") / "08 - Agosto" / "10-08-2026"
+                / "TRANSPORTES BONS LTDA - 5555.pdf")
+        ])
+        # o original sai de _PENDENTES
+        self.assertFalse(list(self.pendentes.glob("*.pdf")))
+
+    def test_sem_vencimento_vai_para_a_revisao(self):
+        self.danfe_real("sem_data.pdf")
+        vistos = {}
+        c.RevisorApp = lambda fila, callback: vistos.update(
+            nomes=[i["nome_base"] for i in fila]
+        )
+        c.reprocessar_pdfs(self.pendentes)
+        self.assertEqual(vistos.get("nomes"), ["DISTRIBUIDORA EXEMPLO LTDA - 4521"])
+
+    def test_revisao_manual_arquiva_e_limpa_a_origem(self):
+        self.danfe_real("sem_data.pdf")
+
+        def revisor(fila, callback):
+            callback(fila[0], [date(2026, 9, 5)], "manual")
+        c.RevisorApp = revisor
+
+        c.reprocessar_pdfs(self.pendentes)
+        self.assertEqual(self.arquivados(), [
+            str(Path("2026") / "09 - Setembro" / "05-09-2026"
+                / "DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf")
+        ])
+        self.assertFalse(list(self.pendentes.glob("*.pdf")))
+
+    def test_pular_deixa_o_arquivo_onde_estava(self):
+        self.danfe_real("sem_data.pdf")
+
+        def revisor(fila, callback):
+            callback(fila[0], [], "pular")
+        c.RevisorApp = revisor
+
+        c.reprocessar_pdfs(self.pendentes)
+        self.assertTrue((self.pendentes / "sem_data.pdf").exists())
+
+    def test_parcelas_na_revisao_espalham_as_copias(self):
+        self.danfe_real("sem_data.pdf")
+
+        def revisor(fila, callback):
+            callback(fila[0], [date(2026, 9, 5), date(2026, 10, 5)], "manual")
+        c.RevisorApp = revisor
+
+        c.reprocessar_pdfs(self.pendentes)
+        self.assertEqual(self.arquivados(), [
+            str(Path("2026") / "09 - Setembro" / "05-09-2026"
+                / "DISTRIBUIDORA EXEMPLO LTDA - 4521 (parcela 1 de 2).pdf"),
+            str(Path("2026") / "10 - Outubro" / "05-10-2026"
+                / "DISTRIBUIDORA EXEMPLO LTDA - 4521 (parcela 2 de 2).pdf"),
+        ])
+
+    def test_pdf_ilegivel_nao_derruba_o_lote(self):
+        (self.pendentes / "quebrado.pdf").write_bytes(b"nao sou um PDF")
+        self.pdf_com_texto("boa.pdf", [
+            "NOTA", "Chave 3526 0712 3456 7800 0199 5500 1000 0045 2110 0004 5218",
+            "Vencimento: 10/08/2026",
+        ])
+        c.reprocessar_pdfs(self.pendentes)
+        self.assertEqual(len(self.arquivados()), 1)
+
+    def test_pasta_vazia_ou_inexistente(self):
+        c.reprocessar_pdfs(self.tmp / "nao_existe")
+        c.reprocessar_pdfs(self.pendentes)      # vazia
+        self.assertEqual(self.arquivados(), [])
+
+    def test_pela_linha_de_comando(self):
+        import sys
+        self.pdf_com_texto("nota.pdf", [
+            "NOTA FISCAL",
+            "Chave 3526 0712 3456 7800 0199 5500 1000 0045 2110 0004 5218",
+            "Vencimento: 20/08/2026",
+        ])
+        originais = (sys.argv, c.ARQUIVO_PREFERENCIAS)
+        c.ARQUIVO_PREFERENCIAS = self.tmp / "preferencias_contas.json"
+        try:
+            sys.argv = ["contas.py", "--reprocessar", str(self.pendentes)]
+            c.main()
+        finally:
+            sys.argv, c.ARQUIVO_PREFERENCIAS = originais
+        self.assertEqual(len(self.arquivados()), 1)
+
 
 class TestParcelasManuais(unittest.TestCase):
     def test_uma_data(self):

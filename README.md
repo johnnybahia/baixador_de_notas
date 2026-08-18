@@ -182,6 +182,24 @@ Segunda etapa: lê os XMLs baixados, gera o DANFE/DACTE/DANFSe e arquiva o PDF
 na pasta do vencimento (`ano/mês/dd-mm-aaaa`). Rode pelo `SEPARAR CONTAS.BAT`
 ou com `python contas.py`.
 
+### As suas pastas
+
+Os caminhos padrão estão no topo do `contas.py`, mas o certo é pôr os seus em
+**`preferencias_contas.json`**, ao lado do script — assim atualizar o
+`contas.py` não apaga a sua configuração:
+
+```json
+{
+  "pasta_origem": "C:\\Users\\User\\Desktop\\pdf notas\\NOTAS DE ENTRADA",
+  "pasta_destino": "C:\\Users\\User\\Desktop\\pdf notas\\NOTAS DE DESTINO",
+  "prazo_cte_dias": 28
+}
+```
+
+Use barra dupla (`\\`) nos caminhos, que é como o JSON escreve a barra invertida.
+O programa mostra as duas pastas assim que abre — se estiverem erradas, você vê
+na hora.
+
 ### Prazo automático dos CT-e
 
 O CT-e de frete quase nunca traz vencimento no XML. Ao abrir, o programa
@@ -237,10 +255,39 @@ cada vencimento:
 Se duas notas diferentes gerarem o mesmo nome, a segunda vira `... [2].pdf` —
 nenhum arquivo é sobrescrito.
 
+### Reprocessar PDFs que já estão em pasta
+
+Nota que você mandou para `_PENDENTES` (botão **Pular**) fica presa lá: o XML
+já foi apagado. Para trazê-las de volta à fila **sem rebaixar XML nenhum**, dois
+cliques em `REPROCESSAR PENDENTES.BAT`, ou:
+
+```bat
+python contas.py --reprocessar                   ← lê a pasta _PENDENTES
+python contas.py --reprocessar "C:\caminho\qualquer"  ← outra pasta de PDFs
+```
+
+Ele lê cada PDF e tira dali o que precisa:
+
+- **chave de acesso**, que vem impressa no documento — daí saem o número e o
+  CNPJ do emitente, e o dígito verificador é conferido para não pegar número
+  errado de um campo vizinho;
+- **razão social do emitente**, do texto;
+- **vencimento**, quando está impresso ("Vencimento: 10/08/2026").
+
+Quem tem vencimento impresso é arquivado direto; o resto abre na janela de
+revisão, com zoom e o campo de parcelas. Depois de arquivado, o PDF sai da pasta
+de origem — quem você **Pular** de novo fica onde está. PDF corrompido é avisado
+e deixado quieto.
+
 ### Renomear o que já foi arquivado antes
 
 Os PDFs arquivados antes desta mudança estão nomeados pela chave de acesso. Para
 acertá-los, sem mexer nos que já estão no padrão novo:
+
+**Isto não acontece sozinho** — rodar o programa normalmente só classifica as
+notas novas. Para corrigir o que já está arquivado, dê **dois cliques em
+`RENOMEAR ANTIGOS.BAT`** (ele mostra a prévia e pergunta antes de mudar), ou use
+a linha de comando:
 
 ```bat
 python contas.py --renomear             ← prévia: mostra o que faria, não muda nada

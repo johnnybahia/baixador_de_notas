@@ -23,6 +23,9 @@ import tkinter as tk
 import pdfplumber
 
 # ===================== CONFIGURACAO =====================
+# Estes sao apenas os valores padrao. Se preferencias_contas.json trouxer
+# "pasta_origem" / "pasta_destino", eles mandam - assim atualizar este
+# arquivo nao apaga os caminhos da sua maquina.
 PASTA_ORIGEM = Path(r"C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO\NOTAS DE ENTRADA")          # so XML
 PASTA_DESTINO = Path(r"C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO\NOTAS DE DESTINO")
 PASTA_PENDENTES = PASTA_DESTINO / "_PENDENTES"
@@ -404,9 +407,15 @@ def limitar_escala(escala, minimo=ZOOM_MINIMO, maximo=ZOOM_MAXIMO):
 # O XML e apagado depois de arquivado, entao o nome do emitente so pode vir
 # do proprio PDF. O numero e o CNPJ, esses, saem da chave - sem adivinhacao.
 RE_EMITENTE_DANFE = re.compile(r"RECEBEMOS DE\s+(.+?)\s+OS PRODUTOS", re.IGNORECASE)
+# Terminacao de razao social - o que realmente identifica uma empresa
 RE_RAZAO_SOCIAL = re.compile(
-    r"\b(LTDA|EIRELI|EPP|S/?A\b|S\.A|SOCIEDADE|COMERCIO|COMÉRCIO|TRANSPORTES?|"
-    r"INDUSTRIA|INDÚSTRIA|SERVICOS|SERVIÇOS|DISTRIBUIDORA)\b",
+    r"\b(LTDA|EIRELI|EPP|MEI|S/A|S\.A|SA)\b\.?", re.IGNORECASE
+)
+# Titulos e cabecalhos do proprio documento, que nao sao nome de ninguem
+RE_TITULO_DOCUMENTO = re.compile(
+    r"DANFE|DACTE|DANFSE|NOTA FISCAL|CONHECIMENTO DE TRANSPORTE|"
+    r"DOCUMENTO AUXILIAR|CHAVE DE ACESSO|PRESTADOR|TOMADOR|DESTINAT|REMETENTE|"
+    r"EMITENTE|CONSULTA DE AUTENTICIDADE|SECRETARIA|MINISTERIO",
     re.IGNORECASE,
 )
 ANCORAS_EMITENTE = ("PRESTADOR", "IDENTIFICACAO DO EMITENTE",
@@ -448,14 +457,23 @@ def emitente_do_pdf(caminho_pdf):
     if m:
         return m.group(1).strip()
 
+    def parece_empresa(linha):
+        # "DACTE - CONHECIMENTO DE TRANSPORTE" nao e nome de empresa, embora
+        # tenha a palavra transporte; por isso os titulos sao descartados.
+        return (
+            RE_RAZAO_SOCIAL.search(linha)
+            and not RE_TITULO_DOCUMENTO.search(linha)
+            and len(linha) <= 70
+        )
+
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
     for i, linha in enumerate(linhas):           # linha logo apos um cabecalho
         if any(a in linha.upper() for a in ANCORAS_EMITENTE):
             for seguinte in linhas[i + 1:i + 4]:
-                if RE_RAZAO_SOCIAL.search(seguinte):
+                if parece_empresa(seguinte):
                     return seguinte
-    for linha in linhas[:25]:                    # ultimo recurso: parece empresa
-        if RE_RAZAO_SOCIAL.search(linha) and len(linha) <= 70:
+    for linha in linhas[:25]:                    # ultimo recurso
+        if parece_empresa(linha):
             return linha
     return None
 
@@ -563,6 +581,174 @@ def desfazer_renomeacoes(pasta):
     return voltados
 
 
+# ============ REPROCESSAR PDFs QUE JA ESTAO EM PASTA ============
+# Serve para as notas que ficaram em _PENDENTES (ou que foram parar na
+# pasta errada): o XML nao existe mais, mas o PDF tem chave, emitente e as
+# vezes o proprio vencimento impresso.
+MODELO_TIPO = {"55": "NFe", "65": "NFe", "57": "CTe", "67": "CTe"}
+
+
+def pdf_legivel(caminho_pdf):
+    """Arquivo corrompido nao adianta mandar para a revisao: a janela
+    tambem nao conseguiria desenhar. Melhor avisar e deixar onde esta."""
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            return len(pdf.pages) > 0
+    except Exception:
+        return False
+
+
+def texto_do_pdf(caminho_pdf, paginas=1):
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages[:paginas])
+    except Exception:
+        return ""
+
+
+RE_CHAVE_AGRUPADA = re.compile(r"(?:\d{4}[ .\-]+){12}\d{2}|(?:\d{4}[ .\-]+){10}\d{4}")
+RE_CHAVE_ISOLADA = re.compile(r"(?<!\d)(?:\d{50}|\d{44})(?!\d)")
+
+
+def dv_chave_valido(chave):
+    """Digito verificador (modulo 11) da chave de 44 digitos."""
+    if len(chave) != 44 or not chave.isdigit():
+        return True                     # a de 50 usa outra regra; nao barra
+    peso, soma = 2, 0
+    for digito in reversed(chave[:43]):
+        soma += int(digito) * peso
+        peso = 2 if peso == 9 else peso + 1
+    resto = soma % 11
+    esperado = 0 if resto in (0, 1) else 11 - resto
+    return esperado == int(chave[43])
+
+
+def chave_do_pdf(texto):
+    """
+    Chave impressa no DANFE/DACTE/DANFSe, normalmente em grupos de 4 digitos.
+
+    Juntar o texto inteiro nao serve: numeros de campos vizinhos se colam e
+    formam uma chave que nao existe. Por isso aceitamos so o formato agrupado
+    ou uma sequencia isolada na linha - e ainda conferimos o digito verificador.
+    """
+    candidatas = [re.sub(r"\D", "", t) for t in RE_CHAVE_AGRUPADA.findall(texto or "")]
+    for linha in (texto or "").splitlines():
+        compacta = re.sub(r"[ .\-]", "", linha)
+        candidatas.extend(m.group(0) for m in RE_CHAVE_ISOLADA.finditer(compacta))
+
+    for chave in candidatas:
+        if len(chave) in (44, 50) and dv_chave_valido(chave):
+            return chave
+    return None
+
+
+def tipo_pela_chave(chave):
+    if not chave:
+        return "DESCONHECIDO"
+    if len(chave) == 50:
+        return "NFSe"
+    return MODELO_TIPO.get(chave[20:22], "DESCONHECIDO")
+
+
+def item_de_pdf(caminho_pdf):
+    """Monta o mesmo 'item' da fase 1, mas lendo o PDF em vez do XML."""
+    texto = texto_do_pdf(caminho_pdf)
+    chave = chave_do_pdf(texto) or (
+        REGEX_CHAVE.search(caminho_pdf.stem).group(0)
+        if REGEX_CHAVE.search(caminho_pdf.stem) else None
+    )
+    dados = dados_da_chave(chave) if chave else None
+    emitente = emitente_do_pdf(caminho_pdf)
+
+    if emitente and dados:
+        nome_base = limpar_para_arquivo(f"{emitente} - {dados['numero']}")
+    elif emitente:
+        nome_base = limpar_para_arquivo(emitente)
+    elif dados:
+        nome_base = limpar_para_arquivo(
+            "CNPJ " + formatar_cnpj(dados["cnpj"]).replace("/", "-")
+            + f" - {dados['numero']}"
+        )
+    else:
+        nome_base = caminho_pdf.stem
+
+    return {
+        "xml_path": caminho_pdf,      # so para o log; aqui a origem e o PDF
+        "pdf_temp": caminho_pdf,
+        "tipo": tipo_pela_chave(chave),
+        "chave": chave,
+        "nome_base": nome_base,
+        "resumo": False,
+    }
+
+
+def reprocessar_pdfs(pasta):
+    """
+    Le os PDFs de uma pasta e os arquiva por vencimento, como se fossem notas
+    novas. Quem tiver vencimento impresso vai direto; o resto passa pela
+    janela de revisao. O arquivo original sai da pasta depois de arquivado.
+    """
+    if not pasta.exists():
+        print(f"Pasta nao encontrada: {pasta}")
+        return
+
+    pdfs = sorted(p for p in pasta.glob("*.pdf"))
+    if not pdfs:
+        print(f"Nenhum PDF em {pasta}")
+        return
+
+    print(f"{len(pdfs)} PDF(s) em {pasta}\n")
+    linhas_log = []
+    fila = []
+    contagem = {"auto": 0, "manual": 0, "a_vista": 0, "pendente": 0}
+
+    def concluir(item, vencimentos, metodo):
+        finalizar_item(item, vencimentos, metodo, linhas_log)
+        if metodo != "pular":          # "pular" deixa o arquivo onde estava
+            try:
+                item["pdf_temp"].unlink()
+            except OSError as e:
+                print(f"  arquivei mas nao consegui remover o original: {e}")
+
+    for caminho in pdfs:
+        try:
+            if not pdf_legivel(caminho):
+                print(f"  {caminho.name}: PDF ilegivel, deixado onde estava.")
+                continue
+            item = item_de_pdf(caminho)
+            data = extrair_vencimento_pdf(caminho)
+            if data:
+                concluir(item, [data], "pdf-regex")
+                contagem["auto"] += 1
+                print(f"  {caminho.name}: vence em {data:%d/%m/%Y}")
+            else:
+                fila.append(item)
+        except Exception:
+            print(f"Erro lendo {caminho.name}:")
+            traceback.print_exc()
+
+    if fila:
+        print(f"\n{len(fila)} sem vencimento no PDF - abrindo a revisao manual.")
+
+        def callback(item, vencimentos, metodo):
+            concluir(item, vencimentos, metodo)
+            if metodo == "manual":
+                contagem["manual"] += 1
+            elif metodo == "a_vista":
+                contagem["a_vista"] += 1
+            else:
+                contagem["pendente"] += 1
+
+        RevisorApp(fila, callback)
+
+    registrar_log(linhas_log)
+    print(
+        f"\nConcluido: {contagem['auto']} pelo vencimento impresso, "
+        f"{contagem['manual']} manual(is), {contagem['a_vista']} a vista, "
+        f"{contagem['pendente']} deixado(s) para depois."
+    )
+
+
 # ===================== ORGANIZACAO EM PASTAS =====================
 def pasta_destino_para_data(data):
     pasta = PASTA_DESTINO / str(data.year) / MESES_PT[data.month] / data.strftime("%d-%m-%Y")
@@ -650,6 +836,34 @@ def salvar_preferencias(preferencias):
         )
     except Exception as e:
         print(f"(nao consegui guardar as preferencias: {e})")
+
+
+def aplicar_pastas_das_preferencias(preferencias):
+    """
+    Deixa os caminhos virem do preferencias_contas.json quando ele os tiver.
+    Substituir o contas.py por uma versao nova nao apaga mais a sua
+    configuracao - ela mora no JSON, ao lado.
+    """
+    global PASTA_ORIGEM, PASTA_DESTINO, PASTA_PENDENTES, PASTA_A_VISTA, ARQUIVO_LOG
+
+    origem = (preferencias.get("pasta_origem") or "").strip()
+    destino = (preferencias.get("pasta_destino") or "").strip()
+    if origem:
+        PASTA_ORIGEM = Path(origem).expanduser()
+    if destino:
+        PASTA_DESTINO = Path(destino).expanduser()
+        PASTA_PENDENTES = PASTA_DESTINO / "_PENDENTES"
+        PASTA_A_VISTA = PASTA_DESTINO / "_A_VISTA_SEM_VENCIMENTO"
+        ARQUIVO_LOG = PASTA_DESTINO / "_log_classificacao.csv"
+
+
+def mostrar_pastas():
+    print(f"Pasta de entrada: {PASTA_ORIGEM}")
+    print(f"Pasta de destino: {PASTA_DESTINO}")
+    if not PASTA_DESTINO.exists():
+        print("  (a pasta de destino nao existe - confira o caminho)")
+    print(f"(para trocar, edite {ARQUIVO_PREFERENCIAS.name}"
+          " com pasta_origem e pasta_destino)\n")
 
 
 def validar_prazo(texto):
@@ -1042,13 +1256,28 @@ class RevisorApp:
 
 # ===================== MAIN =====================
 def main():
+    preferencias = carregar_preferencias()
+    aplicar_pastas_das_preferencias(preferencias)
+
     if "--desfazer-renomear" in sys.argv:
+        mostrar_pastas()
         desfazer_renomeacoes(PASTA_DESTINO)
         return
     if "--renomear" in sys.argv:
+        mostrar_pastas()
         renomear_existentes(PASTA_DESTINO, aplicar="--aplicar" in sys.argv)
         return
+    if "--reprocessar" in sys.argv:
+        mostrar_pastas()
+        indice = sys.argv.index("--reprocessar") + 1
+        if indice < len(sys.argv) and not sys.argv[indice].startswith("-"):
+            alvo = Path(sys.argv[indice]).expanduser()
+        else:
+            alvo = PASTA_PENDENTES
+        reprocessar_pdfs(alvo)
+        return
 
+    mostrar_pastas()
     PASTA_ORIGEM.mkdir(parents=True, exist_ok=True)
     PASTA_DESTINO.mkdir(parents=True, exist_ok=True)
 
@@ -1057,7 +1286,6 @@ def main():
         print("Nenhum XML encontrado na pasta de origem.")
         return
 
-    preferencias = carregar_preferencias()
     prazo_cte = perguntar_prazo_cte(preferencias.get("prazo_cte_dias", 0))
     preferencias["prazo_cte_dias"] = prazo_cte
     salvar_preferencias(preferencias)
