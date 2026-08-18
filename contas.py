@@ -9,13 +9,14 @@ Requisitos:
 
 import os
 import re
+import sys
 import csv
 import shutil
 import tempfile
 import traceback
 import json
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 
@@ -39,6 +40,8 @@ REGEX_VENCIMENTO_PDF = re.compile(
     r"vencimento[:\s]*[^\d]{0,15}(\d{2})[/.\-](\d{2})[/.\-](\d{4})", re.IGNORECASE
 )
 REGEX_CHAVE = re.compile(r"\d{50}|\d{44}")
+# o Windows recusa estes caracteres em nome de arquivo
+CARACTERES_PROIBIDOS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 # Preferencias que a janela inicial guarda entre execucoes
 ARQUIVO_PREFERENCIAS = Path(__file__).parent / "preferencias_contas.json"
@@ -138,6 +141,85 @@ def vencimento_por_prazo(root, tipo, prazo_dias):
     return emissao + timedelta(days=prazo_dias)
 
 
+def primeiro_texto(root, tags):
+    for tag in tags:
+        for el in root.iter():
+            if el.tag.split("}")[-1] == tag and el.text and el.text.strip():
+                return el.text.strip()
+    return ""
+
+
+def nome_do_emitente(root):
+    """Quem emitiu a nota - e quem voce paga. No CT-e, a transportadora."""
+    for grupo in ("emit", "prest", "prestador"):
+        for el in root.iter():
+            if el.tag.split("}")[-1] == grupo:
+                nome = primeiro_texto(el, ("xNome", "xFant"))
+                if nome:
+                    return nome
+    return primeiro_texto(root, ("xNome", "xFant"))
+
+
+def numero_do_documento(root):
+    return primeiro_texto(root, ("nNFSe", "nNF", "nCT", "nDPS"))
+
+
+def limpar_para_arquivo(texto, limite=60):
+    """Tira o que o Windows nao aceita em nome de arquivo."""
+    texto = CARACTERES_PROIBIDOS.sub("", texto or "")
+    texto = re.sub(r"\s+", " ", texto).strip(" .")
+    return texto[:limite].strip(" .")
+
+
+def nome_base_arquivo(root, chave, xml_path):
+    """
+    Nome do PDF: "EMITENTE - NUMERO". Cai para a chave quando o XML nao
+    traz um dos dois - melhor um nome feio do que dois arquivos iguais.
+    """
+    emitente = limpar_para_arquivo(nome_do_emitente(root))
+    numero = limpar_para_arquivo(numero_do_documento(root), limite=15)
+
+    if emitente and numero:
+        return f"{emitente} - {numero}"
+    if emitente:
+        return emitente
+    return chave or xml_path.stem
+
+
+def interpretar_vencimentos(texto, parcelas="1", intervalo="30"):
+    """
+    Le o campo de vencimento da revisao manual. Aceita:
+      "10/08/2026"                          -> uma parcela
+      "10/08/2026, 10/09/2026"              -> duas, como digitadas
+      "10/08/2026" + parcelas 3, a cada 30  -> 10/08, 09/09 e 09/10
+    """
+    datas = []
+    for d, m, a in REGEX_DATA.findall(texto or ""):
+        try:
+            datas.append(date(int(a), int(m), int(d)))
+        except ValueError:
+            raise ValueError(f"Data invalida: {d}/{m}/{a}")
+    if not datas:
+        raise ValueError("Informe ao menos uma data (DD/MM/AAAA).")
+
+    try:
+        quantidade = int(str(parcelas).strip() or 1)
+        passo = int(str(intervalo).strip() or 30)
+    except ValueError:
+        raise ValueError("Parcelas e intervalo devem ser numeros.")
+    if quantidade < 1 or passo < 1:
+        raise ValueError("Parcelas e intervalo devem ser maiores que zero.")
+
+    if quantidade > 1:
+        if len(datas) == 1:
+            datas = [datas[0] + timedelta(days=passo * i) for i in range(quantidade)]
+        elif len(datas) != quantidade:
+            raise ValueError(
+                f"Voce digitou {len(datas)} data(s) e pediu {quantidade} parcelas."
+            )
+    return sorted(set(datas))
+
+
 def extrair_vencimento_nfse(root):
     for el in root.iter():
         tag_local = el.tag.split("}")[-1]
@@ -209,14 +291,6 @@ CAMPOS_RESUMO = (
     ("Emitente", ("xNome", "xFant")),
     ("Descricao", ("xDescServ", "xTribNac", "xNat", "natOp")),
 )
-
-
-def primeiro_texto(root, tags):
-    for tag in tags:
-        for el in root.iter():
-            if el.tag.split("}")[-1] == tag and el.text and el.text.strip():
-                return el.text.strip()
-    return ""
 
 
 def gerar_pdf_resumo(root, tipo, chave, destino_pdf, motivo=""):
@@ -326,6 +400,169 @@ def limitar_escala(escala, minimo=ZOOM_MINIMO, maximo=ZOOM_MAXIMO):
     return max(minimo, min(maximo, escala))
 
 
+# ============ RENOMEAR O QUE JA FOI ARQUIVADO PELA CHAVE ============
+# O XML e apagado depois de arquivado, entao o nome do emitente so pode vir
+# do proprio PDF. O numero e o CNPJ, esses, saem da chave - sem adivinhacao.
+RE_EMITENTE_DANFE = re.compile(r"RECEBEMOS DE\s+(.+?)\s+OS PRODUTOS", re.IGNORECASE)
+RE_RAZAO_SOCIAL = re.compile(
+    r"\b(LTDA|EIRELI|EPP|S/?A\b|S\.A|SOCIEDADE|COMERCIO|COMÉRCIO|TRANSPORTES?|"
+    r"INDUSTRIA|INDÚSTRIA|SERVICOS|SERVIÇOS|DISTRIBUIDORA)\b",
+    re.IGNORECASE,
+)
+ANCORAS_EMITENTE = ("PRESTADOR", "IDENTIFICACAO DO EMITENTE",
+                    "IDENTIFICAÇÃO DO EMITENTE", "EMITENTE", "REMETENTE")
+ARQUIVO_RENOMEACOES = "_renomeacoes.csv"
+
+
+def dados_da_chave(chave):
+    """
+    CNPJ e numero que a propria chave carrega.
+      44 digitos: cUF(2) AAMM(4) CNPJ(14) mod(2) serie(3) nNF(9) ...
+      50 digitos (NFS-e): IBGE(7) amb(1) tpInsc(1) CNPJ(14) nNFSe(13) ...
+    """
+    try:
+        if len(chave) == 44:
+            return {"cnpj": chave[6:20], "numero": str(int(chave[25:34]))}
+        if len(chave) == 50:
+            return {"cnpj": chave[9:23], "numero": str(int(chave[23:36]))}
+    except ValueError:
+        return None
+    return None
+
+
+def formatar_cnpj(cnpj):
+    if len(cnpj) != 14 or not cnpj.isdigit():
+        return cnpj
+    return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+
+
+def emitente_do_pdf(caminho_pdf):
+    """Tenta ler a razao social do emitente no texto do PDF. None se nao achar."""
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            texto = "\n".join(p.extract_text() or "" for p in pdf.pages[:1])
+    except Exception:
+        return None
+
+    m = RE_EMITENTE_DANFE.search(texto)          # canhoto do DANFE
+    if m:
+        return m.group(1).strip()
+
+    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    for i, linha in enumerate(linhas):           # linha logo apos um cabecalho
+        if any(a in linha.upper() for a in ANCORAS_EMITENTE):
+            for seguinte in linhas[i + 1:i + 4]:
+                if RE_RAZAO_SOCIAL.search(seguinte):
+                    return seguinte
+    for linha in linhas[:25]:                    # ultimo recurso: parece empresa
+        if RE_RAZAO_SOCIAL.search(linha) and len(linha) <= 70:
+            return linha
+    return None
+
+
+def novo_nome_para(caminho_pdf):
+    """
+    Nome no padrao novo para um PDF ja arquivado, ou None quando ele nao esta
+    nomeado pela chave (ou seja, ja foi renomeado antes).
+    """
+    m = REGEX_CHAVE.match(caminho_pdf.stem)
+    if not m:
+        return None
+    chave = m.group(0)
+    dados = dados_da_chave(chave)
+    if not dados:
+        return None
+
+    emitente = emitente_do_pdf(caminho_pdf)
+    if not emitente:
+        # a barra do CNPJ nao pode virar nome de arquivo no Windows
+        emitente = "CNPJ " + formatar_cnpj(dados["cnpj"]).replace("/", "-")
+
+    resto = caminho_pdf.stem[len(chave):]        # "(parcela 1 de 2)", "_SEM_PDF_OFICIAL"
+    base = limpar_para_arquivo(f"{emitente} - {dados['numero']}")
+    return f"{base}{resto}{caminho_pdf.suffix}"
+
+
+def renomear_existentes(pasta, aplicar=False):
+    """
+    Passa nas pastas de destino e renomeia so o que ainda esta com a chave.
+    Sem --aplicar, apenas mostra o que faria.
+    """
+    if not pasta.exists():
+        print(f"Pasta nao encontrada: {pasta}")
+        return []
+
+    mudancas = []
+    for caminho in sorted(pasta.rglob("*.pdf")):
+        novo = novo_nome_para(caminho)
+        if not novo or novo == caminho.name:
+            continue
+        mudancas.append((caminho, caminho_livre(caminho.parent, novo)))
+
+    if not mudancas:
+        print("Nada a renomear: todos os PDFs ja estao no padrao novo.")
+        return []
+
+    print(f"{len(mudancas)} arquivo(s) a renomear:\n")
+    for antigo, novo in mudancas[:40]:
+        print(f"  {antigo.name}\n    -> {novo.name}")
+    if len(mudancas) > 40:
+        print(f"  ... e mais {len(mudancas) - 40}")
+
+    if not aplicar:
+        print("\nIsto foi so uma previa - nada mudou ainda.")
+        print("Para aplicar:  python contas.py --renomear --aplicar")
+        return mudancas
+
+    registro = pasta / ARQUIVO_RENOMEACOES
+    novo_registro = not registro.exists()
+    feitos = 0
+    with open(registro, "a", newline="", encoding="utf-8-sig") as f:
+        escritor = csv.writer(f, delimiter=";")
+        if novo_registro:
+            escritor.writerow(["data", "antigo", "novo"])
+        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for antigo, novo in mudancas:
+            try:
+                antigo.rename(novo)
+            except OSError as e:
+                print(f"  nao consegui renomear {antigo.name}: {e}")
+                continue
+            escritor.writerow([agora, str(antigo), str(novo)])
+            feitos += 1
+
+    print(f"\n{feitos} arquivo(s) renomeado(s). Registro em: {registro}")
+    print("Para voltar atras:  python contas.py --desfazer-renomear")
+    return mudancas
+
+
+def desfazer_renomeacoes(pasta):
+    """Volta os nomes usando o registro deixado pelo --renomear --aplicar."""
+    registro = pasta / ARQUIVO_RENOMEACOES
+    if not registro.exists():
+        print(f"Nao ha registro de renomeacao em {registro}")
+        return 0
+
+    with open(registro, newline="", encoding="utf-8-sig") as f:
+        linhas = list(csv.reader(f, delimiter=";"))[1:]
+
+    voltados = 0
+    for linha in reversed(linhas):               # desfaz do mais recente
+        if len(linha) < 3:
+            continue
+        antigo, novo = Path(linha[1]), Path(linha[2])
+        if novo.exists() and not antigo.exists():
+            try:
+                novo.rename(antigo)
+                voltados += 1
+            except OSError as e:
+                print(f"  nao consegui voltar {novo.name}: {e}")
+
+    registro.unlink(missing_ok=True)
+    print(f"{voltados} arquivo(s) com o nome antigo de volta.")
+    return voltados
+
+
 # ===================== ORGANIZACAO EM PASTAS =====================
 def pasta_destino_para_data(data):
     pasta = PASTA_DESTINO / str(data.year) / MESES_PT[data.month] / data.strftime("%d-%m-%Y")
@@ -333,28 +570,56 @@ def pasta_destino_para_data(data):
     return pasta
 
 
+def nome_do_arquivo(item, indice=0, total=1):
+    """
+    "EMITENTE - NUMERO.pdf". Nota parcelada leva a parcela no nome, porque
+    vai uma copia para a pasta de cada vencimento e elas ficam parecidas.
+    """
+    base = item.get("nome_base") or item["chave"] or item["xml_path"].stem
+    if total > 1:
+        base += f" (parcela {indice + 1} de {total})"
+    if item.get("resumo"):
+        base += "_SEM_PDF_OFICIAL"
+    return base + ".pdf"
+
+
+def caminho_livre(pasta, nome):
+    """Nao sobrescreve arquivo de outra nota que tenha o mesmo nome."""
+    destino = pasta / nome
+    if not destino.exists():
+        return destino
+    numero = 2
+    while (pasta / f"{destino.stem} [{numero}]{destino.suffix}").exists():
+        numero += 1
+    return pasta / f"{destino.stem} [{numero}]{destino.suffix}"
+
+
 def finalizar_item(item, vencimentos, metodo, linhas_log):
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # o sufixo marca, na propria pasta, quem ficou sem o documento oficial
-    sufixo = "_SEM_PDF_OFICIAL" if item.get("resumo") else ""
-    nome_pdf = (item["chave"] or item["xml_path"].stem) + sufixo + ".pdf"
+
+    def arquivar(pasta, nome, vencimento=""):
+        pasta.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item["pdf_temp"], caminho_livre(pasta, nome))
+        linhas_log.append([
+            agora, item["xml_path"].name, item["tipo"], item["chave"] or "",
+            vencimento, metodo, str(pasta),
+        ])
 
     if metodo == "pular":
-        PASTA_PENDENTES.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item["pdf_temp"], PASTA_PENDENTES / nome_pdf)
-        linhas_log.append([agora, item["xml_path"].name, item["tipo"], item["chave"] or "", "", "pular", str(PASTA_PENDENTES)])
+        arquivar(PASTA_PENDENTES, nome_do_arquivo(item))
         return
 
     if metodo == "a_vista":
-        PASTA_A_VISTA.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(item["pdf_temp"], PASTA_A_VISTA / nome_pdf)
-        linhas_log.append([agora, item["xml_path"].name, item["tipo"], item["chave"] or "", "A_VISTA", "a_vista", str(PASTA_A_VISTA)])
+        arquivar(PASTA_A_VISTA, nome_do_arquivo(item), "A_VISTA")
         return
 
-    for data in vencimentos:
-        destino = pasta_destino_para_data(data)
-        shutil.copy2(item["pdf_temp"], destino / nome_pdf)
-        linhas_log.append([agora, item["xml_path"].name, item["tipo"], item["chave"] or "", data.strftime("%d/%m/%Y"), metodo, str(destino)])
+    total = len(vencimentos)
+    for indice, data in enumerate(vencimentos):
+        arquivar(
+            pasta_destino_para_data(data),
+            nome_do_arquivo(item, indice, total),
+            data.strftime("%d/%m/%Y"),
+        )
 
 
 def registrar_log(linhas):
@@ -681,12 +946,27 @@ class RevisorApp:
         tk.Button(frame_botoes, text="Pular", width=14, command=self.pular).pack(side=tk.LEFT, padx=4)
         tk.Button(frame_botoes, text="Abrir PDF externo", width=16, command=self.abrir_externo).pack(side=tk.LEFT, padx=4)
 
+        frame_parcelas = tk.Frame(self.root)
+        frame_parcelas.pack(side=tk.BOTTOM, pady=(0, 6))
+        tk.Label(frame_parcelas, text="Parcelas:").pack(side=tk.LEFT)
+        self.entry_parcelas = tk.Spinbox(frame_parcelas, from_=1, to=36, width=3,
+                                         font=("Segoe UI", 10))
+        self.entry_parcelas.pack(side=tk.LEFT, padx=(4, 6))
+        tk.Label(frame_parcelas, text="a cada").pack(side=tk.LEFT)
+        self.entry_intervalo = tk.Entry(frame_parcelas, width=4, font=("Segoe UI", 10),
+                                        justify="center")
+        self.entry_intervalo.pack(side=tk.LEFT, padx=4)
+        tk.Label(frame_parcelas, text="dias  (vai uma copia da nota"
+                                      " para a pasta de cada vencimento)").pack(side=tk.LEFT)
+
         frame_entrada = tk.Frame(self.root)
-        frame_entrada.pack(side=tk.BOTTOM, pady=6)
+        frame_entrada.pack(side=tk.BOTTOM, pady=(6, 0))
         tk.Label(frame_entrada, text="Vencimento (DD/MM/AAAA):").pack(side=tk.LEFT)
-        self.entry_data = tk.Entry(frame_entrada, width=12, font=("Segoe UI", 11))
+        self.entry_data = tk.Entry(frame_entrada, width=34, font=("Segoe UI", 11))
         self.entry_data.pack(side=tk.LEFT, padx=6)
         self.entry_data.bind("<Return>", lambda e: self.confirmar())
+        tk.Label(frame_entrada, text="varias datas: separe por virgula",
+                 fg="#666").pack(side=tk.LEFT)
 
         self.visualizador = VisualizadorPdf(self.root)
         self.visualizador.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
@@ -713,6 +993,10 @@ class RevisorApp:
         item = self._item_atual()
         self.label_erro.config(text="")
         self.entry_data.delete(0, tk.END)
+        self.entry_parcelas.delete(0, tk.END)
+        self.entry_parcelas.insert(0, "1")
+        self.entry_intervalo.delete(0, tk.END)
+        self.entry_intervalo.insert(0, "30")
         self.label_nome.config(text=item["xml_path"].name)
         self.label_contador.config(text=f"{self.indice + 1} de {len(self.fila)}")
         try:
@@ -728,17 +1012,16 @@ class RevisorApp:
         abrir_pdf(self._item_atual()["pdf_temp"])
 
     def confirmar(self):
-        m = REGEX_DATA.match(self.entry_data.get().strip())
-        if not m:
-            self.label_erro.config(text="Data invalida. Use DD/MM/AAAA.")
-            return
-        d, mth, a = m.groups()
         try:
-            data = datetime(int(a), int(mth), int(d)).date()
-        except ValueError:
-            self.label_erro.config(text="Data invalida.")
+            datas = interpretar_vencimentos(
+                self.entry_data.get(),
+                self.entry_parcelas.get(),
+                self.entry_intervalo.get(),
+            )
+        except ValueError as e:
+            self.label_erro.config(text=str(e))
             return
-        self.callback_finalizar(self._item_atual(), [data], "manual")
+        self.callback_finalizar(self._item_atual(), datas, "manual")
         self._avancar()
 
     def a_vista(self):
@@ -759,6 +1042,13 @@ class RevisorApp:
 
 # ===================== MAIN =====================
 def main():
+    if "--desfazer-renomear" in sys.argv:
+        desfazer_renomeacoes(PASTA_DESTINO)
+        return
+    if "--renomear" in sys.argv:
+        renomear_existentes(PASTA_DESTINO, aplicar="--aplicar" in sys.argv)
+        return
+
     PASTA_ORIGEM.mkdir(parents=True, exist_ok=True)
     PASTA_DESTINO.mkdir(parents=True, exist_ok=True)
 
@@ -804,7 +1094,8 @@ def main():
                     contagem["resumo"] += 1
 
                 item = {"xml_path": xml_path, "tipo": tipo, "chave": chave,
-                        "pdf_temp": nome_pdf_temp, "resumo": resumo}
+                        "pdf_temp": nome_pdf_temp, "resumo": resumo,
+                        "nome_base": nome_base_arquivo(root, chave, xml_path)}
 
                 vencimentos = []
                 if tipo in ("NFe", "CTe"):
