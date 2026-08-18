@@ -1,3 +1,16 @@
+# Instale tudo de uma vez:  pip install -r requirements.txt
+
+# --- baixador.py (download dos XML) ---
 requests>=2.31
 cryptography>=42.0
 openpyxl>=3.1
+
+# --- contas.py (classificador por vencimento) ---
+pdfplumber>=0.11          # le o vencimento impresso no PDF
+pymupdf>=1.24             # desenha o PDF na tela, com zoom
+pillow>=10.0              # leva a imagem do PDF para a janela
+brazilfiscalreport[dacte]>=1.0   # gera DANFE (NF-e) e DACTE (CT-e)
+pynfse-nacional[pdf]>=0.9        # gera DANFSe (NFS-e) - o extra [pdf] e obrigatorio
+
+# A interface usa tkinter, que ja vem com o Python no Windows
+# (no instalador, deixe marcado "tcl/tk and IDLE").
