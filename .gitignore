@@ -13,3 +13,4 @@ venv/
 build/
 dist/
 *.spec
+preferencias_contas.json

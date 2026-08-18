@@ -151,11 +151,52 @@ Nacional não entrega documento mais antigo que isso via distribuição por NSU.
 - **`cuf`** é o código IBGE da UF do autor da consulta (29 BA, 31 MG, 33 RJ,
   35 SP, 41 PR…), não o do emissor da nota.
 
+## Classificador de vencimentos (`contas.py`)
+
+Segunda etapa: lê os XMLs baixados, gera o DANFE/DACTE/DANFSe e arquiva o PDF
+na pasta do vencimento (`ano/mês/dd-mm-aaaa`). Rode pelo `SEPARAR CONTAS.BAT`
+ou com `python contas.py`.
+
+### Prazo automático dos CT-e
+
+O CT-e de frete quase nunca traz vencimento no XML. Ao abrir, o programa
+pergunta em quantos dias após a emissão o frete vence — e guarda a resposta em
+`preferencias_contas.json` para a próxima execução.
+
+A ordem de decisão é:
+
+1. duplicata do XML (`dVenc`), quando existe — vale para NF-e e CT-e;
+2. "Vencimento: dd/mm/aaaa" impresso no PDF;
+3. **só para CT-e**, emissão + o prazo informado.
+
+Deixe o campo em `0` (ou vazio) para desligar. **Nota de serviço e qualquer
+nota sem prazo continuam indo para a revisão manual, uma a uma** — o prazo do
+frete não é aplicado a elas. O método usado fica registrado no
+`_log_classificacao.csv` (`xml`, `pdf-regex`, `prazo-cte-28d`, `manual`…).
+
+### Visualizador de PDF
+
+A janela de revisão mostra a nota com zoom:
+
+| Ação | Como |
+|---|---|
+| Aumentar / diminuir | botões `−` `+`, `Ctrl` + `+` / `Ctrl` + `−`, ou `Ctrl` + roda do mouse |
+| Caber na largura | botão **Largura** (padrão ao abrir cada nota) |
+| Caber a página inteira | botão **Ajustar** ou `Ctrl` + `0` |
+| Rolar | roda do mouse, `Shift` + roda na horizontal, ou arrastar com o botão esquerdo |
+| Trocar de página | botões `◀` `▶` |
+
+O zoom escolhido na mão é respeitado; enquanto você não mexe, a nota se
+reajusta sozinha ao redimensionar a janela.
+
 ## Testes
 
 ```bash
-python -m unittest testes_baixador -v
+python -m unittest testes_baixador -v    # baixador
+python -m unittest testes_contas -v      # classificador
 ```
 
 Os testes não acessam a rede nem precisam de certificado real: usam sessões
-HTTP falsas e um `.pfx` auto-assinado gerado na hora.
+HTTP falsas e um `.pfx` auto-assinado gerado na hora. Os do classificador
+abrem janelas de verdade para conferir o zoom — em máquina sem interface
+gráfica, esses são pulados automaticamente.
