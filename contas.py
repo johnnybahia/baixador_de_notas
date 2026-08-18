@@ -23,6 +23,9 @@ import tkinter as tk
 import pdfplumber
 
 # ===================== CONFIGURACAO =====================
+# Estes sao apenas os valores padrao. Se preferencias_contas.json trouxer
+# "pasta_origem" / "pasta_destino", eles mandam - assim atualizar este
+# arquivo nao apaga os caminhos da sua maquina.
 PASTA_ORIGEM = Path(r"C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO\NOTAS DE ENTRADA")          # so XML
 PASTA_DESTINO = Path(r"C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO\NOTAS DE DESTINO")
 PASTA_PENDENTES = PASTA_DESTINO / "_PENDENTES"
@@ -652,6 +655,34 @@ def salvar_preferencias(preferencias):
         print(f"(nao consegui guardar as preferencias: {e})")
 
 
+def aplicar_pastas_das_preferencias(preferencias):
+    """
+    Deixa os caminhos virem do preferencias_contas.json quando ele os tiver.
+    Substituir o contas.py por uma versao nova nao apaga mais a sua
+    configuracao - ela mora no JSON, ao lado.
+    """
+    global PASTA_ORIGEM, PASTA_DESTINO, PASTA_PENDENTES, PASTA_A_VISTA, ARQUIVO_LOG
+
+    origem = (preferencias.get("pasta_origem") or "").strip()
+    destino = (preferencias.get("pasta_destino") or "").strip()
+    if origem:
+        PASTA_ORIGEM = Path(origem).expanduser()
+    if destino:
+        PASTA_DESTINO = Path(destino).expanduser()
+        PASTA_PENDENTES = PASTA_DESTINO / "_PENDENTES"
+        PASTA_A_VISTA = PASTA_DESTINO / "_A_VISTA_SEM_VENCIMENTO"
+        ARQUIVO_LOG = PASTA_DESTINO / "_log_classificacao.csv"
+
+
+def mostrar_pastas():
+    print(f"Pasta de entrada: {PASTA_ORIGEM}")
+    print(f"Pasta de destino: {PASTA_DESTINO}")
+    if not PASTA_DESTINO.exists():
+        print("  (a pasta de destino nao existe - confira o caminho)")
+    print(f"(para trocar, edite {ARQUIVO_PREFERENCIAS.name}"
+          " com pasta_origem e pasta_destino)\n")
+
+
 def validar_prazo(texto):
     """Texto do campo -> dias. Vazio e 0 desligam o prazo automatico."""
     texto = (texto or "").strip()
@@ -1042,13 +1073,19 @@ class RevisorApp:
 
 # ===================== MAIN =====================
 def main():
+    preferencias = carregar_preferencias()
+    aplicar_pastas_das_preferencias(preferencias)
+
     if "--desfazer-renomear" in sys.argv:
+        mostrar_pastas()
         desfazer_renomeacoes(PASTA_DESTINO)
         return
     if "--renomear" in sys.argv:
+        mostrar_pastas()
         renomear_existentes(PASTA_DESTINO, aplicar="--aplicar" in sys.argv)
         return
 
+    mostrar_pastas()
     PASTA_ORIGEM.mkdir(parents=True, exist_ok=True)
     PASTA_DESTINO.mkdir(parents=True, exist_ok=True)
 
@@ -1057,7 +1094,6 @@ def main():
         print("Nenhum XML encontrado na pasta de origem.")
         return
 
-    preferencias = carregar_preferencias()
     prazo_cte = perguntar_prazo_cte(preferencias.get("prazo_cte_dias", 0))
     preferencias["prazo_cte_dias"] = prazo_cte
     salvar_preferencias(preferencias)

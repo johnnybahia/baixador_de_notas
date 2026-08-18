@@ -352,6 +352,52 @@ class TestRenomearExistentes(unittest.TestCase):
     def test_pasta_inexistente_nao_estoura(self):
         self.assertEqual(c.renomear_existentes(self.tmp / "nao_existe"), [])
 
+    def test_pela_linha_de_comando(self):
+        """Como o usuario roda: python contas.py --renomear --aplicar"""
+        import sys
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+
+        originais = (c.PASTA_DESTINO, c.ARQUIVO_PREFERENCIAS, sys.argv)
+        c.PASTA_DESTINO = self.tmp
+        c.ARQUIVO_PREFERENCIAS = self.tmp / "preferencias_contas.json"
+        try:
+            sys.argv = ["contas.py", "--renomear"]          # previa
+            c.main()
+            self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+
+            sys.argv = ["contas.py", "--renomear", "--aplicar"]
+            c.main()
+            self.assertEqual(self.nomes(), ["DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf"])
+
+            sys.argv = ["contas.py", "--desfazer-renomear"]
+            c.main()
+            self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+        finally:
+            c.PASTA_DESTINO, c.ARQUIVO_PREFERENCIAS, sys.argv = originais
+
+    def test_pastas_vem_do_json_e_sobrevivem_a_atualizacao(self):
+        originais = (c.PASTA_ORIGEM, c.PASTA_DESTINO, c.ARQUIVO_LOG,
+                     c.PASTA_PENDENTES, c.PASTA_A_VISTA)
+        try:
+            c.aplicar_pastas_das_preferencias({
+                "pasta_origem": str(self.tmp / "entrada"),
+                "pasta_destino": str(self.tmp / "destino"),
+            })
+            self.assertEqual(c.PASTA_ORIGEM, self.tmp / "entrada")
+            self.assertEqual(c.PASTA_DESTINO, self.tmp / "destino")
+            self.assertEqual(c.PASTA_PENDENTES, self.tmp / "destino" / "_PENDENTES")
+            self.assertEqual(
+                c.ARQUIVO_LOG, self.tmp / "destino" / "_log_classificacao.csv"
+            )
+        finally:
+            (c.PASTA_ORIGEM, c.PASTA_DESTINO, c.ARQUIVO_LOG,
+             c.PASTA_PENDENTES, c.PASTA_A_VISTA) = originais
+
+    def test_json_sem_pastas_nao_mexe_nos_padroes(self):
+        antes = (c.PASTA_ORIGEM, c.PASTA_DESTINO)
+        c.aplicar_pastas_das_preferencias({"prazo_cte_dias": 28})
+        self.assertEqual((c.PASTA_ORIGEM, c.PASTA_DESTINO), antes)
+
 
 class TestParcelasManuais(unittest.TestCase):
     def test_uma_data(self):

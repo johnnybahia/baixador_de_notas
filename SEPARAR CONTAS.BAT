@@ -2,7 +2,9 @@
 chcp 65001 >nul
 title Classificador de Notas por Vencimento
 
-set "PASTA=C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO"
+rem %~dp0 = a pasta onde este .BAT esta, entao ele funciona
+rem em qualquer computador, sem caminho fixo
+set "PASTA=%~dp0"
 set "SCRIPT=contas.py"
 
 cd /d "%PASTA%"

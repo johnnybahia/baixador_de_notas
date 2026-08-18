@@ -182,6 +182,24 @@ Segunda etapa: lê os XMLs baixados, gera o DANFE/DACTE/DANFSe e arquiva o PDF
 na pasta do vencimento (`ano/mês/dd-mm-aaaa`). Rode pelo `SEPARAR CONTAS.BAT`
 ou com `python contas.py`.
 
+### As suas pastas
+
+Os caminhos padrão estão no topo do `contas.py`, mas o certo é pôr os seus em
+**`preferencias_contas.json`**, ao lado do script — assim atualizar o
+`contas.py` não apaga a sua configuração:
+
+```json
+{
+  "pasta_origem": "C:\\Users\\User\\Desktop\\pdf notas\\NOTAS DE ENTRADA",
+  "pasta_destino": "C:\\Users\\User\\Desktop\\pdf notas\\NOTAS DE DESTINO",
+  "prazo_cte_dias": 28
+}
+```
+
+Use barra dupla (`\\`) nos caminhos, que é como o JSON escreve a barra invertida.
+O programa mostra as duas pastas assim que abre — se estiverem erradas, você vê
+na hora.
+
 ### Prazo automático dos CT-e
 
 O CT-e de frete quase nunca traz vencimento no XML. Ao abrir, o programa
@@ -241,6 +259,11 @@ nenhum arquivo é sobrescrito.
 
 Os PDFs arquivados antes desta mudança estão nomeados pela chave de acesso. Para
 acertá-los, sem mexer nos que já estão no padrão novo:
+
+**Isto não acontece sozinho** — rodar o programa normalmente só classifica as
+notas novas. Para corrigir o que já está arquivado, dê **dois cliques em
+`RENOMEAR ANTIGOS.BAT`** (ele mostra a prévia e pergunta antes de mudar), ou use
+a linha de comando:
 
 ```bat
 python contas.py --renomear             ← prévia: mostra o que faria, não muda nada
