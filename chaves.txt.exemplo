@@ -1,0 +1,7 @@
+# Cole aqui as chaves de acesso, UMA POR LINHA (ate 20 por vez).
+# Vale NF-e, CT-e e NFS-e misturadas - o programa reconhece cada uma.
+# Pode colar do portal com espacos: 2925 0712 3456 ...
+# Linhas comecando com # sao ignoradas, como esta.
+#
+# Exemplo (apague e ponha as suas):
+# 29250712345678000199550010000012341000012349

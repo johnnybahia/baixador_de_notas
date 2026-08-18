@@ -530,6 +530,36 @@ class TestChaves(BaseTemp):
         validas, _ = b.normalizar_chaves([CHAVE_NFE, CHAVE_CTE])
         self.assertEqual(validas, [CHAVE_NFE, CHAVE_CTE])
 
+    def test_le_chaves_de_arquivo(self):
+        arquivo = self.tmp / "chaves.txt"
+        arquivo.write_text(
+            "# comentario que deve ser ignorado\n"
+            f"{CHAVE_NFE}\n"
+            f"{CHAVE_CTE}\n"
+            "\n"
+            f"{CHAVE_NFSE}\n",
+            encoding="utf-8",
+        )
+        validas, erros = b.normalizar_chaves([arquivo.read_text(encoding="utf-8")])
+        self.assertEqual(validas, [CHAVE_NFE, CHAVE_CTE, CHAVE_NFSE])
+        self.assertEqual(erros, [])
+
+    def test_arquivo_com_bom_e_espacos_do_portal(self):
+        arquivo = self.tmp / "chaves.txt"
+        espacada = " ".join(CHAVE_NFE[i:i + 4] for i in range(0, 44, 4))
+        arquivo.write_text(f"﻿{espacada}\n", encoding="utf-8")
+        validas, _ = b.normalizar_chaves(
+            [arquivo.read_text(encoding="utf-8-sig")]
+        )
+        self.assertEqual(validas, [CHAVE_NFE])
+
+    def test_limite_subiu_para_vinte(self):
+        self.assertEqual(b.MAX_CHAVES, 20)
+        muitas = [f"29250712345678000199550{str(i).zfill(21)}" for i in range(20)]
+        validas, erros = b.normalizar_chaves(["\n".join(muitas)])
+        self.assertEqual(len(validas), 20)
+        self.assertEqual(erros, [])
+
     def test_recusa_chave_incompleta(self):
         validas, erros = b.normalizar_chaves(["123456", CHAVE_NFE])
         self.assertEqual(validas, [CHAVE_NFE])

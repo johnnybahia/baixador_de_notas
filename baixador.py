@@ -110,7 +110,7 @@ RE_DATA_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 
 # Modelo do documento: posicoes 21-22 da chave de 44 digitos
 MODELO_SERVICO = {"55": "nfe", "65": "nfe", "57": "cte", "67": "cte"}
-MAX_CHAVES = 10
+MAX_CHAVES = 20
 
 
 # ===================== CONFIGURACAO =====================
@@ -847,7 +847,7 @@ def normalizar_chaves(entradas):
     texto = " ".join(str(e) for e in entradas)
     for candidato in re.split(r"[,;\n]+", texto):
         candidato = candidato.strip()
-        if not candidato:
+        if not candidato or candidato.startswith("#"):   # linha de comentario
             continue
         pedacos = candidato.split()
 
@@ -1026,6 +1026,9 @@ def montar_argumentos(argv=None):
     p.add_argument("--chave", nargs="+", metavar="CHAVE",
                    help=f"baixa ate {MAX_CHAVES} documentos por chave de acesso "
                         "(NF-e, CT-e ou NFS-e) e sai; nao mexe no NSU")
+    p.add_argument("--chaves-de", type=Path, metavar="ARQUIVO",
+                   help="le as chaves de um arquivo texto (uma por linha; "
+                        "linhas comecando com # sao ignoradas)")
     p.add_argument("--de", metavar="DATA",
                    help="so grava documentos a partir desta data (dd/mm/aaaa)")
     p.add_argument("--ate", metavar="DATA",
@@ -1107,9 +1110,18 @@ def main(argv=None):
         log.info("Periodo configurado: %s", cfg.descricao_periodo())
         return 0
 
+    entradas_chave = list(args.chave or [])
+    if args.chaves_de:
+        if not args.chaves_de.exists():
+            print(f"arquivo de chaves nao encontrado: {args.chaves_de}")
+            return 1
+        entradas_chave.append(
+            args.chaves_de.read_text(encoding="utf-8-sig", errors="replace")
+        )
+
     chaves = erros_chave = None
-    if args.chave:
-        chaves, erros_chave = normalizar_chaves(args.chave)
+    if entradas_chave:
+        chaves, erros_chave = normalizar_chaves(entradas_chave)
         for ruim in erros_chave:
             print(f"chave invalida (esperado 44 ou 50 digitos): {ruim}")
         if not chaves:

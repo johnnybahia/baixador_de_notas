@@ -108,8 +108,34 @@ ADN não informa o `maxNSU`.
 
 ## Baixar documentos avulsos por chave
 
-Até 10 chaves por execução, misturando os três tipos. O script identifica
-sozinho o que é cada uma (modelo 55/65 = NF-e, 57/67 = CT-e, 50 dígitos = NFS-e):
+Até **20 chaves** por execução, misturando os três tipos. O script identifica
+sozinho o que é cada uma (modelo 55/65 = NF-e, 57/67 = CT-e, 50 dígitos = NFS-e).
+
+### Jeito mais prático: o arquivo `chaves.txt`
+
+Digitar 20 chaves de 44 dígitos no Prompt é sofrimento. Use o arquivo:
+
+1. dois cliques em **`BUSCAR NOTAS POR CHAVE.BAT`**
+2. ele abre o `chaves.txt` no Bloco de Notas
+3. cole as chaves, **uma por linha**, salve e feche
+4. ele busca sozinho
+
+Ou, na mão:
+
+```bat
+python baixador.py --chaves-de chaves.txt
+```
+
+O arquivo aceita chave crua ou colada do portal com espaços, e linhas
+começando com `#` são ignoradas — dá para deixar anotações no meio:
+
+```
+# notas do fornecedor X, pedido 4432
+29250712345678000199550010000012341000012349
+2925 0712 3456 7800 0199 5500 1000 0012 3410 0001 2349
+```
+
+### Pela linha de comando
 
 ```bash
 python baixador.py --chave 29250712345678000199550010000012341000012349
@@ -118,7 +144,8 @@ python baixador.py --chave "2925 0712 3456 7800 0199 5500 1000 0012 3410 0001 23
 ```
 
 Aceita chave crua, colada do portal em grupos de 4, ou várias separadas por
-espaço, vírgula ou quebra de linha. Nesse modo o script **não mexe no NSU** e
+espaço, vírgula ou quebra de linha. Dá para misturar `--chave` e `--chaves-de`
+na mesma execução. Nesse modo o script **não mexe no NSU** e
 **ignora o filtro de período** — você pediu aquela nota, ela é gravada.
 
 Por baixo: NF-e e CT-e vão por `consChNFe`/`consChCTe` no mesmo
