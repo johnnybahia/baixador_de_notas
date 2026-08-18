@@ -220,6 +220,71 @@ você saber quais conferir no portal.
 O XML original nunca é alterado — a remoção do grupo acontece só na cópia usada
 para desenhar o PDF.
 
+### Nome dos arquivos
+
+O PDF é arquivado como **`EMITENTE - NUMERO.pdf`** — quem emitiu a nota (no
+CT-e, a transportadora) e o número dela. Se o XML não trouxer um dos dois, cai
+para a chave de acesso.
+
+Nota parcelada leva a parcela no nome, porque vai uma cópia para a pasta de
+cada vencimento:
+
+```
+2026/08 - Agosto/14-08-2026/FORNECEDOR EXEMPLO LTDA - 4521 (parcela 1 de 2).pdf
+2026/09 - Setembro/13-09-2026/FORNECEDOR EXEMPLO LTDA - 4521 (parcela 2 de 2).pdf
+```
+
+Se duas notas diferentes gerarem o mesmo nome, a segunda vira `... [2].pdf` —
+nenhum arquivo é sobrescrito.
+
+### Renomear o que já foi arquivado antes
+
+Os PDFs arquivados antes desta mudança estão nomeados pela chave de acesso. Para
+acertá-los, sem mexer nos que já estão no padrão novo:
+
+```bat
+python contas.py --renomear             ← prévia: mostra o que faria, não muda nada
+python contas.py --renomear --aplicar   ← renomeia de verdade
+python contas.py --desfazer-renomear    ← volta tudo, se não gostar
+```
+
+Como o XML é apagado depois do arquivamento, o nome do emitente é lido **de
+dentro do próprio PDF**. Já o **número e o CNPJ saem da chave de acesso**, que os
+carrega — nada de adivinhação:
+
+| Chave | Onde está o CNPJ | Onde está o número |
+|---|---|---|
+| 44 dígitos (NF-e, CT-e) | posições 7 a 20 | posições 26 a 34 |
+| 50 dígitos (NFS-e) | posições 10 a 23 | posições 24 a 36 |
+
+Se o nome do emitente não puder ser lido do PDF, o arquivo fica
+`CNPJ 12.345.678-0001-99 - 4521.pdf` — feio, mas correto e identificável.
+Sufixos de parcela e de resumo são preservados, e nenhum arquivo é sobrescrito.
+
+Sempre rode a prévia primeiro. A leitura do nome dentro do PDF foi testada com um
+DANFE real; para DACTE e DANFSe ela usa marcações genéricas ("PRESTADOR",
+"EMITENTE") e pode não acertar todos — a prévia existe justamente para você ver
+antes, e o `--desfazer-renomear` para voltar depois.
+
+### Notas parceladas
+
+Quando o XML traz as duplicatas (`dVenc`), as parcelas são detectadas sozinhas
+e cada pasta de vencimento recebe uma cópia.
+
+Quando não traz — nota de serviço, ou nota sem data de vencimento — dá para
+lançar as parcelas na revisão manual, de dois jeitos:
+
+| O que você quer | O que digitar |
+|---|---|
+| Uma data só | `10/08/2026` |
+| Datas irregulares | `10/08/2026, 25/09/2026, 30/10/2026` |
+| 3 parcelas a cada 30 dias | `10/08/2026` e ponha **Parcelas: 3**, **a cada 30 dias** |
+| 2 parcelas quinzenais | `01/08/2026` e ponha **Parcelas: 2**, **a cada 15 dias** |
+
+Datas repetidas viram uma só, e a ordem não importa — são ordenadas sozinhas.
+Cada parcela recebe uma cópia da nota na pasta do seu vencimento, e uma linha
+própria no `_log_classificacao.csv`.
+
 ### Visualizador de PDF
 
 A janela de revisão mostra a nota com zoom:

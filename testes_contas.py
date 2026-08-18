@@ -27,7 +27,8 @@ def cte(dh_emi="2026-07-16T08:00:00-03:00", com_vencimento=False):
     return (
         '<cteProc xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00">'
         f'<CTe><infCte Id="CTe{CHAVE_CTE}">'
-        f"<ide><cUF>29</cUF><dhEmi>{dh_emi}</dhEmi></ide>"
+        f"<ide><cUF>29</cUF><nCT>333</nCT><dhEmi>{dh_emi}</dhEmi></ide>"
+        "<emit><xNome>TRANSPORTADORA TESTE LTDA</xNome></emit>"
         # o CT-e cita a NF-e transportada, mas sem data dela
         f"<infCTeNorm><infDoc><infNFe><chave>{'9' * 44}</chave></infNFe></infDoc>"
         f"</infCTeNorm>{cobranca}"
@@ -43,7 +44,9 @@ def nfe(dh_emi="2026-07-15T10:00:00-03:00", com_vencimento=True):
     return (
         '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">'
         f'<NFe><infNFe Id="NFe{"1" * 44}">'
-        f"<ide><dhEmi>{dh_emi}</dhEmi></ide>{cobranca}"
+        f"<ide><nNF>4521</nNF><dhEmi>{dh_emi}</dhEmi></ide>"
+        "<emit><xNome>FORNECEDOR TESTE LTDA</xNome></emit>"
+        f"{cobranca}"
         "</infNFe></NFe></nfeProc>"
     )
 
@@ -107,6 +110,300 @@ class TestPrazoCte(unittest.TestCase):
             c.extrair_vencimentos_nfe_cte(raiz(nfe())),
             [date(2026, 8, 14), date(2026, 9, 13)],
         )
+
+
+class TestNomeDoArquivo(unittest.TestCase):
+    def test_usa_emitente_e_numero(self):
+        xml = (
+            '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe">'
+            f'<NFe><infNFe Id="NFe{"1" * 44}">'
+            "<ide><nNF>4521</nNF></ide>"
+            "<emit><xNome>DISTRIBUIDORA EXEMPLO LTDA</xNome></emit>"
+            "<dest><xNome>MINHA EMPRESA LTDA</xNome></dest>"
+            "</infNFe></NFe></nfeProc>"
+        )
+        self.assertEqual(
+            c.nome_base_arquivo(raiz(xml), "1" * 44, Path("nota.xml")),
+            "DISTRIBUIDORA EXEMPLO LTDA - 4521",
+        )
+
+    def test_pega_o_emitente_e_nao_o_destinatario(self):
+        xml = (
+            '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe"><NFe><infNFe>'
+            "<dest><xNome>QUEM RECEBE</xNome></dest>"
+            "<emit><xNome>QUEM EMITE</xNome></emit>"
+            "<ide><nNF>9</nNF></ide></infNFe></NFe></nfeProc>"
+        )
+        self.assertEqual(
+            c.nome_base_arquivo(raiz(xml), None, Path("x.xml")), "QUEM EMITE - 9"
+        )
+
+    def test_transportadora_no_cte(self):
+        xml = (
+            '<cteProc xmlns="http://www.portalfiscal.inf.br/cte"><CTe><infCte>'
+            "<ide><nCT>777</nCT></ide>"
+            "<emit><xNome>TRANSPORTES RAPIDOS SA</xNome></emit>"
+            "</infCte></CTe></cteProc>"
+        )
+        self.assertEqual(
+            c.nome_base_arquivo(raiz(xml), None, Path("x.xml")),
+            "TRANSPORTES RAPIDOS SA - 777",
+        )
+
+    def test_tira_caracteres_que_o_windows_recusa(self):
+        xml = (
+            "<NFSe><emit><xNome>COMERCIO A/B: LTDA *?</xNome></emit>"
+            "<nNFSe>12</nNFSe></NFSe>"
+        )
+        nome = c.nome_base_arquivo(raiz(xml), None, Path("x.xml"))
+        self.assertEqual(nome, "COMERCIO AB LTDA - 12")
+        for proibido in '<>:"/\\|?*':
+            self.assertNotIn(proibido, nome)
+
+    def test_nome_comprido_e_cortado(self):
+        longo = "EMPRESA " * 30
+        xml = f"<NFSe><emit><xNome>{longo}</xNome></emit><nNFSe>1</nNFSe></NFSe>"
+        nome = c.nome_base_arquivo(raiz(xml), None, Path("x.xml"))
+        self.assertLessEqual(len(nome), 80)
+
+    def test_sem_emitente_cai_para_a_chave(self):
+        xml = "<NFSe><x>1</x></NFSe>"
+        self.assertEqual(c.nome_base_arquivo(raiz(xml), "3" * 50, Path("x.xml")), "3" * 50)
+
+    def test_parcela_aparece_no_nome(self):
+        item = {"nome_base": "FORNECEDOR - 10", "chave": None,
+                "xml_path": Path("x.xml")}
+        self.assertEqual(c.nome_do_arquivo(item, 0, 1), "FORNECEDOR - 10.pdf")
+        self.assertEqual(
+            c.nome_do_arquivo(item, 1, 3), "FORNECEDOR - 10 (parcela 2 de 3).pdf"
+        )
+
+
+CHAVE_NFE_REAL = "35260712345678000199550010000045211000045218"
+
+
+def nfe_completa():
+    """NF-e valida o bastante para o brazilfiscalreport desenhar o DANFE."""
+    ns = "http://www.portalfiscal.inf.br/nfe"
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<nfeProc xmlns="{ns}" versao="4.00"><NFe><infNFe Id="NFe{CHAVE_NFE_REAL}" versao="4.00">
+<ide><cUF>35</cUF><cNF>10000452</cNF><natOp>VENDA</natOp><mod>55</mod><serie>1</serie>
+<nNF>4521</nNF><dhEmi>2026-07-15T10:00:00-03:00</dhEmi><tpNF>1</tpNF><idDest>1</idDest>
+<cMunFG>3550308</cMunFG><tpImp>1</tpImp><tpEmis>1</tpEmis><cDV>8</cDV><tpAmb>1</tpAmb>
+<finNFe>1</finNFe><indFinal>0</indFinal><indPres>1</indPres><procEmi>0</procEmi>
+<verProc>1.0</verProc></ide>
+<emit><CNPJ>12345678000199</CNPJ><xNome>DISTRIBUIDORA EXEMPLO LTDA</xNome><xFant>EXEMPLO</xFant>
+<enderEmit><xLgr>RUA UM</xLgr><nro>100</nro><xBairro>CENTRO</xBairro><cMun>3550308</cMun>
+<xMun>SAO PAULO</xMun><UF>SP</UF><CEP>01000000</CEP><cPais>1058</cPais><xPais>BRASIL</xPais>
+<fone>1130000000</fone></enderEmit><IE>1234567890</IE><CRT>3</CRT></emit>
+<dest><CNPJ>98765432000188</CNPJ><xNome>MINHA EMPRESA LTDA</xNome>
+<enderDest><xLgr>RUA DOIS</xLgr><nro>200</nro><xBairro>CENTRO</xBairro><cMun>3550308</cMun>
+<xMun>SAO PAULO</xMun><UF>SP</UF><CEP>02000000</CEP><cPais>1058</cPais><xPais>BRASIL</xPais>
+</enderDest><indIEDest>9</indIEDest></dest>
+<det nItem="1"><prod><cProd>1</cProd><cEAN>SEM GTIN</cEAN><xProd>PRODUTO TESTE</xProd>
+<NCM>84713012</NCM><CFOP>5102</CFOP><uCom>UN</uCom><qCom>1.0000</qCom><vUnCom>100.00</vUnCom>
+<vProd>100.00</vProd><cEANTrib>SEM GTIN</cEANTrib><uTrib>UN</uTrib><qTrib>1.0000</qTrib>
+<vUnTrib>100.00</vUnTrib><indTot>1</indTot></prod>
+<imposto><ICMS><ICMS00><orig>0</orig><CST>00</CST><modBC>3</modBC><vBC>100.00</vBC>
+<pICMS>18.00</pICMS><vICMS>18.00</vICMS></ICMS00></ICMS>
+<PIS><PISAliq><CST>01</CST><vBC>100.00</vBC><pPIS>1.65</pPIS><vPIS>1.65</vPIS></PISAliq></PIS>
+<COFINS><COFINSAliq><CST>01</CST><vBC>100.00</vBC><pCOFINS>7.60</pCOFINS><vCOFINS>7.60</vCOFINS>
+</COFINSAliq></COFINS></imposto></det>
+<total><ICMSTot><vBC>100.00</vBC><vICMS>18.00</vICMS><vICMSDeson>0.00</vICMSDeson>
+<vFCP>0.00</vFCP><vBCST>0.00</vBCST><vST>0.00</vST><vFCPST>0.00</vFCPST><vFCPSTRet>0.00</vFCPSTRet>
+<vProd>100.00</vProd><vFrete>0.00</vFrete><vSeg>0.00</vSeg><vDesc>0.00</vDesc><vII>0.00</vII>
+<vIPI>0.00</vIPI><vIPIDevol>0.00</vIPIDevol><vPIS>1.65</vPIS><vCOFINS>7.60</vCOFINS>
+<vOutro>0.00</vOutro><vNF>100.00</vNF></ICMSTot></total>
+<transp><modFrete>9</modFrete></transp>
+<cobr><fat><nFat>4521</nFat><vOrig>100.00</vOrig><vLiq>100.00</vLiq></fat>
+<dup><nDup>001</nDup><dVenc>2026-08-14</dVenc><vDup>100.00</vDup></dup></cobr>
+<pag><detPag><tPag>15</tPag><vPag>100.00</vPag></detPag></pag>
+<infAdic><infCpl>Observacoes</infCpl></infAdic>
+</infNFe></NFe><protNFe versao="4.00"><infProt><tpAmb>1</tpAmb><verAplic>SP</verAplic>
+<chNFe>{CHAVE_NFE_REAL}</chNFe><dhRecbto>2026-07-15T10:05:00-03:00</dhRecbto>
+<nProt>135260000000001</nProt><digVal>abc</digVal><cStat>100</cStat>
+<xMotivo>Autorizado o uso da NF-e</xMotivo></infProt></protNFe></nfeProc>'''
+
+
+class TestDadosDaChave(unittest.TestCase):
+    def test_chave_de_44_digitos(self):
+        dados = c.dados_da_chave(CHAVE_NFE_REAL)
+        self.assertEqual(dados["cnpj"], "12345678000199")
+        self.assertEqual(dados["numero"], "4521")
+
+    def test_chave_de_nfse_com_50_digitos(self):
+        # chave real do usuario: CNPJ 23.973.005/0001-04, NFS-e 256
+        dados = c.dados_da_chave("23037091223973005000104000000000025626082809817912")
+        self.assertEqual(dados["cnpj"], "23973005000104")
+        self.assertEqual(dados["numero"], "256")
+
+    def test_outra_chave_de_nfse(self):
+        dados = c.dados_da_chave("23042851212968028000104000000000062126046560779793")
+        self.assertEqual(dados["cnpj"], "12968028000104")
+        self.assertEqual(dados["numero"], "621")
+
+    def test_chave_de_tamanho_estranho(self):
+        self.assertIsNone(c.dados_da_chave("123"))
+
+    def test_formata_cnpj(self):
+        self.assertEqual(c.formatar_cnpj("12345678000199"), "12.345.678/0001-99")
+        self.assertEqual(c.formatar_cnpj("abc"), "abc")
+
+
+class TestRenomearExistentes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.pasta = self.tmp / "2026" / "08 - Agosto" / "14-08-2026"
+        self.pasta.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def danfe_real(self, nome):
+        from brazilfiscalreport.danfe import Danfe
+        destino = self.pasta / nome
+        Danfe(xml=nfe_completa()).output(str(destino))
+        return destino
+
+    def pdf_com_texto(self, nome, linhas):
+        from reportlab.pdfgen import canvas as rl
+        destino = self.pasta / nome
+        pdf = rl.Canvas(str(destino))
+        y = 800
+        for linha in linhas:
+            pdf.drawString(40, y, linha)
+            y -= 16
+        pdf.showPage()
+        pdf.save()
+        return destino
+
+    def nomes(self):
+        return sorted(p.name for p in self.tmp.rglob("*.pdf"))
+
+    def test_le_o_emitente_de_um_danfe_de_verdade(self):
+        caminho = self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+        self.assertEqual(c.emitente_do_pdf(caminho), "DISTRIBUIDORA EXEMPLO LTDA")
+        self.assertEqual(
+            c.novo_nome_para(caminho), "DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf"
+        )
+
+    def test_renomeia_de_verdade_com_aplicar(self):
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+        c.renomear_existentes(self.tmp, aplicar=True)
+        self.assertEqual(self.nomes(), ["DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf"])
+
+    def test_previa_nao_mexe_em_nada(self):
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+        c.renomear_existentes(self.tmp, aplicar=False)
+        self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+
+    def test_desfaz_a_renomeacao(self):
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+        c.renomear_existentes(self.tmp, aplicar=True)
+        c.desfazer_renomeacoes(self.tmp)
+        self.assertEqual(self.nomes(), [f"{CHAVE_NFE_REAL}.pdf"])
+        self.assertFalse((self.tmp / c.ARQUIVO_RENOMEACOES).exists())
+
+    def test_nao_toca_em_quem_ja_esta_no_padrao_novo(self):
+        self.pdf_com_texto("FORNECEDOR X LTDA - 10.pdf", ["qualquer coisa"])
+        c.renomear_existentes(self.tmp, aplicar=True)
+        self.assertEqual(self.nomes(), ["FORNECEDOR X LTDA - 10.pdf"])
+
+    def test_preserva_sufixos_de_parcela_e_de_resumo(self):
+        nome = f"{CHAVE_NFE_REAL} (parcela 2 de 3).pdf"
+        self.assertEqual(
+            c.novo_nome_para(self.danfe_real(nome)),
+            "DISTRIBUIDORA EXEMPLO LTDA - 4521 (parcela 2 de 3).pdf",
+        )
+        nome2 = f"{CHAVE_NFE_REAL}_SEM_PDF_OFICIAL.pdf"
+        self.assertEqual(
+            c.novo_nome_para(self.danfe_real(nome2)),
+            "DISTRIBUIDORA EXEMPLO LTDA - 4521_SEM_PDF_OFICIAL.pdf",
+        )
+
+    def test_sem_emitente_legivel_usa_o_cnpj_da_chave(self):
+        caminho = self.pdf_com_texto(f"{CHAVE_NFE_REAL}.pdf", ["pagina sem nome algum"])
+        self.assertEqual(
+            c.novo_nome_para(caminho), "CNPJ 12.345.678-0001-99 - 4521.pdf"
+        )
+
+    def test_ancora_de_prestador_da_nfse(self):
+        chave = "23037091223973005000104000000000025626082809817912"
+        caminho = self.pdf_com_texto(f"{chave}.pdf", [
+            "DANFSE - NOTA FISCAL DE SERVICO ELETRONICA",
+            "PRESTADOR DE SERVICOS",
+            "CLINICA EXEMPLO SERVICOS MEDICOS LTDA",
+            "CNPJ 23.973.005/0001-04",
+        ])
+        self.assertEqual(
+            c.novo_nome_para(caminho),
+            "CLINICA EXEMPLO SERVICOS MEDICOS LTDA - 256.pdf",
+        )
+
+    def test_nao_sobrescreve_arquivo_existente(self):
+        self.danfe_real(f"{CHAVE_NFE_REAL}.pdf")
+        self.pdf_com_texto("DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf", ["outro arquivo"])
+        c.renomear_existentes(self.tmp, aplicar=True)
+        self.assertEqual(self.nomes(), [
+            "DISTRIBUIDORA EXEMPLO LTDA - 4521 [2].pdf",
+            "DISTRIBUIDORA EXEMPLO LTDA - 4521.pdf",
+        ])
+
+    def test_pasta_inexistente_nao_estoura(self):
+        self.assertEqual(c.renomear_existentes(self.tmp / "nao_existe"), [])
+
+
+class TestParcelasManuais(unittest.TestCase):
+    def test_uma_data(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("10/08/2026"), [date(2026, 8, 10)]
+        )
+
+    def test_varias_datas_separadas_por_virgula(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("10/08/2026, 10/09/2026; 10/10/2026"),
+            [date(2026, 8, 10), date(2026, 9, 10), date(2026, 10, 10)],
+        )
+
+    def test_gera_parcelas_a_partir_de_uma_data(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("10/08/2026", parcelas="3", intervalo="30"),
+            [date(2026, 8, 10), date(2026, 9, 9), date(2026, 10, 9)],
+        )
+
+    def test_intervalo_livre(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("01/08/2026", parcelas="2", intervalo="15"),
+            [date(2026, 8, 1), date(2026, 8, 16)],
+        )
+
+    def test_datas_repetidas_viram_uma(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("10/08/2026, 10/08/2026"), [date(2026, 8, 10)]
+        )
+
+    def test_datas_fora_de_ordem_sao_ordenadas(self):
+        self.assertEqual(
+            c.interpretar_vencimentos("10/10/2026, 10/08/2026"),
+            [date(2026, 8, 10), date(2026, 10, 10)],
+        )
+
+    def test_campo_vazio_reclama(self):
+        with self.assertRaises(ValueError):
+            c.interpretar_vencimentos("")
+
+    def test_data_impossivel_reclama(self):
+        with self.assertRaises(ValueError):
+            c.interpretar_vencimentos("31/02/2026")
+
+    def test_quantidade_de_datas_diferente_das_parcelas_reclama(self):
+        with self.assertRaises(ValueError) as ctx:
+            c.interpretar_vencimentos("10/08/2026, 10/09/2026", parcelas="3")
+        self.assertIn("3 parcelas", str(ctx.exception))
+
+    def test_parcela_nao_numerica_reclama(self):
+        with self.assertRaises(ValueError):
+            c.interpretar_vencimentos("10/08/2026", parcelas="tres")
 
 
 class TestValidacaoDoPrazo(unittest.TestCase):
@@ -306,7 +603,8 @@ class TestFluxoCompleto(unittest.TestCase):
         # emissao 16/07/2026 + 28 dias = 13/08/2026
         self.assertEqual(
             self.caminhos(),
-            [str(Path("2026") / "08 - Agosto" / "13-08-2026" / f"{CHAVE_CTE}.pdf")],
+            [str(Path("2026") / "08 - Agosto" / "13-08-2026"
+                 / "TRANSPORTADORA TESTE LTDA - 333.pdf")],
         )
         self.assertFalse(list(self.origem.glob("*.xml")))   # XML consumido
 
@@ -339,11 +637,13 @@ class TestFluxoCompleto(unittest.TestCase):
         c.perguntar_prazo_cte = lambda padrao=0: 28
         self.escrever("nfe.xml", nfe())
         c.main()
-        # duas parcelas, duas pastas
+        # duas parcelas, duas pastas, cada copia dizendo qual parcela e
         self.assertEqual(
             self.caminhos(),
-            [str(Path("2026") / "08 - Agosto" / "14-08-2026" / f"{'1' * 44}.pdf"),
-             str(Path("2026") / "09 - Setembro" / "13-09-2026" / f"{'1' * 44}.pdf")],
+            [str(Path("2026") / "08 - Agosto" / "14-08-2026"
+                 / "FORNECEDOR TESTE LTDA - 4521 (parcela 1 de 2).pdf"),
+             str(Path("2026") / "09 - Setembro" / "13-09-2026"
+                 / "FORNECEDOR TESTE LTDA - 4521 (parcela 2 de 2).pdf")],
         )
 
     def test_nota_sem_pdf_oficial_e_arquivada_como_resumo(self):
@@ -370,6 +670,47 @@ class TestFluxoCompleto(unittest.TestCase):
     @staticmethod
     def _sempre_falha(xml_content, output_path):
         raise RuntimeError("falha simulada da biblioteca")
+
+    def test_nota_parcelada_vai_uma_copia_para_cada_pasta(self):
+        item = {"xml_path": Path("nota.xml"), "tipo": "NFSe", "chave": "3" * 50,
+                "pdf_temp": self.tmp / "x.pdf", "nome_base": "PRESTADOR - 88"}
+        (self.tmp / "x.pdf").write_bytes(b"%PDF-1.4")
+        linhas = []
+
+        c.finalizar_item(
+            item,
+            [date(2026, 8, 10), date(2026, 9, 9), date(2026, 10, 9)],
+            "manual", linhas,
+        )
+
+        self.assertEqual(self.caminhos(), [
+            str(Path("2026") / "08 - Agosto" / "10-08-2026" / "PRESTADOR - 88 (parcela 1 de 3).pdf"),
+            str(Path("2026") / "09 - Setembro" / "09-09-2026" / "PRESTADOR - 88 (parcela 2 de 3).pdf"),
+            str(Path("2026") / "10 - Outubro" / "09-10-2026" / "PRESTADOR - 88 (parcela 3 de 3).pdf"),
+        ])
+        self.assertEqual(len(linhas), 3)   # uma linha de log por parcela
+
+    def test_parcela_unica_nao_ganha_rotulo(self):
+        item = {"xml_path": Path("nota.xml"), "tipo": "NFe", "chave": "1" * 44,
+                "pdf_temp": self.tmp / "x.pdf", "nome_base": "FORNECEDOR - 5"}
+        (self.tmp / "x.pdf").write_bytes(b"%PDF-1.4")
+        c.finalizar_item(item, [date(2026, 8, 10)], "manual", [])
+        self.assertEqual(self.caminhos(), [
+            str(Path("2026") / "08 - Agosto" / "10-08-2026" / "FORNECEDOR - 5.pdf")
+        ])
+
+    def test_nota_diferente_com_nome_igual_nao_sobrescreve(self):
+        (self.tmp / "x.pdf").write_bytes(b"%PDF-1.4")
+        for _ in range(2):
+            c.finalizar_item(
+                {"xml_path": Path("nota.xml"), "tipo": "NFe", "chave": None,
+                 "pdf_temp": self.tmp / "x.pdf", "nome_base": "MESMO NOME - 1"},
+                [date(2026, 8, 10)], "manual", [],
+            )
+        self.assertEqual(self.caminhos(), [
+            str(Path("2026") / "08 - Agosto" / "10-08-2026" / "MESMO NOME - 1 [2].pdf"),
+            str(Path("2026") / "08 - Agosto" / "10-08-2026" / "MESMO NOME - 1.pdf"),
+        ])
 
     def test_resumo_ganha_sufixo_no_nome_do_arquivo(self):
         item = {"xml_path": Path("nota.xml"), "tipo": "NFSe",
