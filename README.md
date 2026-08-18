@@ -40,8 +40,15 @@ Outras opções: `--config CAMINHO`, `--sem-conferencia`, `--ignorar-bloqueio`.
 ## Escolher um período (em vez dos 90 dias)
 
 **As três APIs paginam por NSU e nenhuma aceita filtro por data.** Não existe
-"me dê só julho" — o que o script faz é: grava apenas o que está no período e
-pula o resto.
+"me dê só julho". O que o script faz é baixar tudo do mesmo jeito e **separar
+por pasta** — nada é descartado:
+
+```
+<pasta de saída>/
+├── <notas do período>.xml
+├── _EVENTOS_E_RESUMOS/
+└── _FORA_DO_PERIODO/     ← baixadas, fora do intervalo escolhido
+```
 
 ```bash
 python baixador.py --de 01/07/2026 --ate 31/07/2026
@@ -50,29 +57,29 @@ python baixador.py --ultimos 15                       # janela móvel
 
 Também dá para fixar no `config.ini`, seção `[PERIODO]` (`de`, `ate` ou
 `ultimos_dias`), útil para execução agendada. A linha de comando tem preferência.
+Sem nada configurado, tudo cai direto na pasta de saída, como antes.
 
-Com o período definido, a varredura ainda passa pelos lotes anteriores — só não
-grava o que está fora. Para **não baixar** os lotes antigos, use:
+O filtro vale para nota **e** evento, cada um pela sua própria data — um
+cancelamento de agosto de uma nota de julho vai para `_FORA_DO_PERIODO`, mas
+está lá. Documento cuja data não dá para ler é sempre tratado como dentro do
+período, para não sumir da vista por falha de leitura.
+
+### `--pular-anteriores` (esse sim deixa notas para trás)
 
 ```bash
 python baixador.py --de 01/07/2026 --pular-anteriores
 ```
 
-O `--pular-anteriores` faz uma busca binária (~10 a 15 requisições) pelo NSU em
-que o período começa e salta direto para lá, com uma margem de 200 NSUs para
-trás por causa de nota autorizada com atraso. Vale para NF-e e CT-e; a NFS-e não
-tem como, porque o ADN não informa o `maxNSU`.
+Faz uma busca binária (~10 a 15 requisições) pelo NSU em que o período começa e
+salta direto para lá, com margem de 200 NSUs para trás por causa de nota
+autorizada com atraso. Serve para quando você quer economizar tempo e cota da
+SEFAZ ao começar do zero. Vale para NF-e e CT-e; a NFS-e não tem como, porque o
+ADN não informa o `maxNSU`.
 
-Dois avisos:
-
-- Os documentos pulados **não voltam** nas próximas execuções, porque o ponteiro
-  de NSU avança. Para buscá-los depois: `--servico nfe --nsu 0`.
-- O filtro vale para nota **e** evento, cada um pela sua própria data. Um
-  cancelamento de agosto referente a uma nota de julho fica de fora de
-  `--ate 31/07`.
-
-Documento cuja data não dá para ler é sempre gravado — melhor um XML a mais do
-que perder nota por falha de leitura.
+> **Atenção:** o que for pulado **não volta** nas próximas execuções, porque o
+> ponteiro de NSU avança. Se a ideia é não perder nada, não use esta opção — o
+> período sozinho já separa as pastas sem descartar nota. Para buscar o que ficou
+> para trás: `--servico nfe --nsu 0`.
 
 ## Baixar documentos avulsos por chave
 
@@ -105,8 +112,9 @@ execuções se atropelem.
 ```
 <pasta de saída>/
 ├── 29250712345678000199550010000012341000012349.xml   ← documento, nome = chave
-└── _EVENTOS_E_RESUMOS/
-    └── 2925...349-procEventoNFe-000000000000042.xml   ← evento/resumo
+├── _EVENTOS_E_RESUMOS/
+│   └── 2925...349-procEventoNFe-000000000000042.xml   ← evento/resumo
+└── _FORA_DO_PERIODO/                                  ← só se houver período
 ```
 
 - **Documento** (`nfeProc`, `cteProc`, `NFSe`, …) vai para a raiz da pasta de

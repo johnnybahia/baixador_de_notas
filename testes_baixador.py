@@ -145,6 +145,10 @@ class BaseTemp(unittest.TestCase):
     def eventos_dir(self):
         return self.cfg.pasta_saida / "_EVENTOS_E_RESUMOS"
 
+    @property
+    def fora_dir(self):
+        return self.cfg.pasta_saida / "_FORA_DO_PERIODO"
+
 
 class TestChaveENome(unittest.TestCase):
     def test_extrai_chave_do_id(self):
@@ -398,7 +402,7 @@ class TestPeriodo(BaseTemp):
         with self.assertRaises(ValueError):
             self.cfg.validar_periodo()
 
-    def test_grava_so_o_que_esta_no_periodo(self):
+    def test_separa_o_periodo_sem_descartar_nada(self):
         self.cfg.periodo_de = date(2026, 7, 1)
         self.cfg.periodo_ate = date(2026, 7, 31)
 
@@ -406,17 +410,25 @@ class TestPeriodo(BaseTemp):
         antes = nfe_proc("1".ljust(44, "3"), "2026-06-20T10:00:00-03:00")
         depois = nfe_proc("2".ljust(44, "4"), "2026-08-05T10:00:00-03:00")
 
-        self.assertIsNotNone(b.gravar_xml(self.cfg, dentro, "NFE", self.contadores))
-        self.assertIsNone(b.gravar_xml(self.cfg, antes, "NFE", self.contadores))
-        self.assertIsNone(b.gravar_xml(self.cfg, depois, "NFE", self.contadores))
+        na_pasta = b.gravar_xml(self.cfg, dentro, "NFE", self.contadores)
+        fora_1 = b.gravar_xml(self.cfg, antes, "NFE", self.contadores)
+        fora_2 = b.gravar_xml(self.cfg, depois, "NFE", self.contadores)
+
+        self.assertEqual(na_pasta.parent, self.cfg.pasta_saida)
+        self.assertEqual(fora_1.parent, self.fora_dir)
+        self.assertEqual(fora_2.parent, self.fora_dir)
 
         self.assertEqual(self.contadores["documentos"], 1)
         self.assertEqual(self.contadores["fora_periodo"], 2)
+        # o classificador so enxerga a raiz: uma nota
         self.assertEqual(len(list(self.cfg.pasta_saida.glob("*.xml"))), 1)
+        # mas nada foi perdido
+        self.assertEqual(len(list(self.fora_dir.glob("*.xml"))), 2)
 
     def test_documento_sem_data_e_gravado(self):
         self.cfg.periodo_de = date(2026, 7, 1)
-        self.assertIsNotNone(b.gravar_xml(self.cfg, resumo_nfe(), "NFE", self.contadores))
+        destino = b.gravar_xml(self.cfg, resumo_nfe(), "NFE", self.contadores)
+        self.assertEqual(destino.parent, self.eventos_dir)
 
     def test_consulta_por_chave_ignora_o_periodo(self):
         self.cfg.periodo_de = date(2026, 7, 1)
@@ -436,6 +448,7 @@ class TestPeriodo(BaseTemp):
         b.rodar_soap(self.cfg, "nfe", sessao, info, self.contadores)
         self.assertEqual(len(sessao.chamadas), 1)
         self.assertEqual(self.contadores["fora_periodo"], 1)
+        self.assertEqual(len(list(self.fora_dir.glob("*.xml"))), 1)
 
 
 class TestAvancarNsu(BaseTemp):

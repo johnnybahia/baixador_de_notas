@@ -470,31 +470,33 @@ def dentro_do_periodo(cfg, data):
 
 def gravar_xml(cfg, conteudo, prefixo, contadores, nsu=None, data=None,
                ignorar_periodo=False):
-    """Grava documentos processaveis na raiz; eventos/resumos em subpasta."""
-    if not ignorar_periodo:
-        if data is None:
-            data = data_do_documento(conteudo)
-        if not dentro_do_periodo(cfg, data):
-            contadores["fora_periodo"] += 1
-            return None
-
+    """
+    Nada baixado e jogado fora: o periodo apenas escolhe a pasta.
+      dentro do periodo  -> pasta de saida (documento) ou _EVENTOS_E_RESUMOS
+      fora do periodo    -> _FORA_DO_PERIODO
+    """
     raiz = raiz_do_xml(conteudo)
     documento = raiz in RAIZES_DOCUMENTO
 
-    if documento:
-        pasta = cfg.pasta_saida
-        contadores["documentos"] += 1
+    if not ignorar_periodo and data is None:
+        data = data_do_documento(conteudo)
+    fora = not ignorar_periodo and not dentro_do_periodo(cfg, data)
+
+    if fora:
+        pasta, contador = cfg.pasta_saida / "_FORA_DO_PERIODO", "fora_periodo"
+    elif documento:
+        pasta, contador = cfg.pasta_saida, "documentos"
     else:
-        pasta = cfg.pasta_saida / "_EVENTOS_E_RESUMOS"
-        contadores["eventos"] += 1
+        pasta, contador = cfg.pasta_saida / "_EVENTOS_E_RESUMOS", "eventos"
 
     pasta.mkdir(parents=True, exist_ok=True)
     destino = pasta / nome_arquivo(conteudo, prefixo, raiz, nsu, documento)
     if destino.exists():
-        contadores["documentos" if documento else "eventos"] -= 1
         contadores["duplicados"] += 1
         return None
+
     destino.write_text(conteudo, encoding="utf-8")
+    contadores[contador] += 1
     return destino
 
 

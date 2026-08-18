@@ -31,7 +31,9 @@ nfse = sim
 
 [PERIODO]
 ; Opcional: so grava documentos emitidos no intervalo (dd/mm/aaaa).
-; Em branco = tudo que o ambiente nacional entregar (ate 90 dias).
+; Em branco = tudo cai direto na pasta de saida (ate 90 dias).
+; Nada e descartado: o que fica fora do intervalo vai para a subpasta
+; _FORA_DO_PERIODO dentro da pasta de saida.
 ; As opcoes --de / --ate / --ultimos na linha de comando tem preferencia.
 de =
 ate =
