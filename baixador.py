@@ -1065,8 +1065,19 @@ def main(argv=None):
     args = montar_argumentos(argv)
 
     if not args.config.exists():
+        exemplo = base_execucao() / "config.ini.exemplo"
         print(f"config.ini nao encontrado em {args.config}")
-        print("Copie o config.ini.exemplo, ajuste os caminhos e rode de novo.")
+        print("\nEle nao vem junto com o programa porque guarda a senha do")
+        print("certificado. Crie o seu a partir do exemplo:\n")
+        if os.name == "nt":
+            print(f'    copy "{exemplo}" "{args.config}"')
+            print(f'    notepad "{args.config}"')
+        else:
+            print(f'    cp "{exemplo}" "{args.config}"')
+        print("\nPreencha CNPJ, cUF, o caminho do .pfx, a senha e as pastas.")
+        if not exemplo.exists():
+            print(f"\nAVISO: o exemplo tambem sumiu ({exemplo}).")
+            print("Baixe o projeto de novo ou veja o modelo no README.")
         return 1
     try:
         cfg = Config.de_arquivo(args.config)

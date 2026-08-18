@@ -199,6 +199,27 @@ nota sem prazo continuam indo para a revisão manual, uma a uma** — o prazo do
 frete não é aplicado a elas. O método usado fica registrado no
 `_log_classificacao.csv` (`xml`, `pdf-regex`, `prazo-cte-28d`, `manual`…).
 
+### Quando o PDF oficial não sai
+
+Algumas NFS-e trazem o grupo IBS/CBS (reforma tributária) com campo vazio, e a
+biblioteca que desenha o DANFSe recusa o XML inteiro por causa disso
+(`cIndOp inválido`). Isso é um defeito dela: ela tenta ignorar falhas de
+validação nesse grupo, mas a própria exceção não é capturada pelo `except`.
+
+O classificador contorna em dois níveis:
+
+1. tenta de novo sem o grupo IBS/CBS — ele só carrega tributos, nada que
+   interesse ao controle de vencimento, e o DANFSe sai completo no resto;
+2. se ainda assim não sair, monta uma **folha de resumo** com o que dá para ler
+   do XML (número, emissão, valor, emitente, chave e o motivo da falha).
+
+A nota nunca fica presa por causa disso. Quem for arquivado como resumo ganha
+`_SEM_PDF_OFICIAL` no nome do arquivo e aparece contado no fim da execução, para
+você saber quais conferir no portal.
+
+O XML original nunca é alterado — a remoção do grupo acontece só na cópia usada
+para desenhar o PDF.
+
 ### Visualizador de PDF
 
 A janela de revisão mostra a nota com zoom:

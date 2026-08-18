@@ -152,6 +152,106 @@ class TestPreferencias(unittest.TestCase):
         self.assertEqual(c.carregar_preferencias(), {})
 
 
+NS_NFSE = "http://www.sped.fazenda.gov.br/nfse"
+
+
+def nfse_com_ibscbs(c_ind_op=""):
+    """NFS-e com o grupo IBS/CBS da reforma tributaria; vazio derruba a lib."""
+    return (
+        f'<NFSe xmlns="{NS_NFSE}"><infNFSe Id="NFS{"3" * 50}">'
+        "<nNFSe>77</nNFSe><dhProc>2026-07-10T09:00:00-03:00</dhProc>"
+        "<valores><vLiq>1234.56</vLiq></valores>"
+        f"<IBSCBS><finNFSe>0</finNFSe><cIndOp>{c_ind_op}</cIndOp>"
+        "<indDest>0</indDest></IBSCBS>"
+        "</infNFSe></NFSe>"
+    )
+
+
+class TestGrupoIbsCbs(unittest.TestCase):
+    def test_remove_o_grupo(self):
+        limpo = c.remover_ibscbs(nfse_com_ibscbs())
+        self.assertNotIn("IBSCBS", limpo)
+        self.assertIn("1234.56", limpo)       # o resto do XML continua la
+
+    def test_sem_o_grupo_devolve_none(self):
+        self.assertIsNone(c.remover_ibscbs(nfse()))
+
+    def test_lib_falha_com_campo_vazio_e_passa_sem_o_grupo(self):
+        """O bug de origem: a excecao da lib escapa do proprio except dela."""
+        from pynfse_nacional.response_parsers import parse_ibscbs
+        from pynfse_nacional.exceptions import NFSeError
+
+        with self.assertRaises(NFSeError):
+            parse_ibscbs(nfse_com_ibscbs())
+        self.assertIsNone(parse_ibscbs(c.remover_ibscbs(nfse_com_ibscbs())))
+
+    def test_gerar_pdf_tenta_de_novo_sem_o_grupo(self):
+        chamadas = []
+
+        def gerador_falso(xml_content, output_path):
+            chamadas.append(xml_content)
+            if "IBSCBS" in xml_content:
+                raise RuntimeError("cIndOp invalido (valor redigido (0 caracteres)).")
+            Path(output_path).write_bytes(b"%PDF-1.4")
+
+        import pynfse_nacional.pdf_generator as gerador
+        original = gerador.generate_danfse_from_xml
+        gerador.generate_danfse_from_xml = gerador_falso
+        try:
+            tmp = Path(tempfile.mkdtemp())
+            c.gerar_pdf("NFSe", nfse_com_ibscbs(), tmp / "nota.pdf")
+            self.assertEqual(len(chamadas), 2)          # falhou, tirou o grupo, passou
+            self.assertNotIn("IBSCBS", chamadas[1])
+            self.assertTrue((tmp / "nota.pdf").exists())
+            shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            gerador.generate_danfse_from_xml = original
+
+    def test_erro_sem_relacao_com_o_grupo_continua_estourando(self):
+        def sempre_falha(xml_content, output_path):
+            raise RuntimeError("outro problema qualquer")
+
+        import pynfse_nacional.pdf_generator as gerador
+        original = gerador.generate_danfse_from_xml
+        gerador.generate_danfse_from_xml = sempre_falha
+        try:
+            with self.assertRaises(RuntimeError):
+                c.gerar_pdf("NFSe", nfse(), Path(tempfile.mkdtemp()) / "x.pdf")
+        finally:
+            gerador.generate_danfse_from_xml = original
+
+
+class TestPdfResumo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def texto_do_pdf(self, caminho):
+        import pdfplumber
+        with pdfplumber.open(caminho) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+    def test_resumo_traz_os_dados_da_nota(self):
+        destino = self.tmp / "resumo.pdf"
+        c.gerar_pdf_resumo(
+            raiz(nfse_com_ibscbs()), "NFSe", "3" * 50, destino,
+            motivo="NFSeValidationError: cIndOp invalido",
+        )
+        texto = self.texto_do_pdf(destino)
+        self.assertIn("RESUMO DO DOCUMENTO", texto)
+        self.assertIn("3" * 20, texto)          # a chave aparece
+        self.assertIn("1234.56", texto)         # o valor aparece
+        self.assertIn("cIndOp", texto)          # e o motivo da falha
+
+    def test_resumo_de_xml_pobre_nao_estoura(self):
+        destino = self.tmp / "vazio.pdf"
+        c.gerar_pdf_resumo(raiz("<NFSe><x>1</x></NFSe>"), "NFSe", None, destino)
+        self.assertTrue(destino.exists())
+        self.assertIn("nao encontrada", self.texto_do_pdf(destino))
+
+
 class TestFluxoCompleto(unittest.TestCase):
     """Fase automatica de ponta a ponta, sem gerar PDF de verdade."""
 
@@ -245,6 +345,41 @@ class TestFluxoCompleto(unittest.TestCase):
             [str(Path("2026") / "08 - Agosto" / "14-08-2026" / f"{'1' * 44}.pdf"),
              str(Path("2026") / "09 - Setembro" / "13-09-2026" / f"{'1' * 44}.pdf")],
         )
+
+    def test_nota_sem_pdf_oficial_e_arquivada_como_resumo(self):
+        c.perguntar_prazo_cte = lambda padrao=0: 0
+        # o PDF oficial falha; o classificador nao pode perder a nota
+        c.gerar_pdf = self.originais[6]   # devolve o gerar_pdf de verdade
+
+        import pynfse_nacional.pdf_generator as gerador
+        original_gerador = gerador.generate_danfse_from_xml
+        gerador.generate_danfse_from_xml = self._sempre_falha
+
+        vistos = {}
+        c.RevisorApp = lambda fila, callback: vistos.update(
+            nomes=[i["pdf_temp"].name for i in fila], resumo=[i["resumo"] for i in fila]
+        )
+        try:
+            self.escrever("nfse.xml", nfse_com_ibscbs())
+            c.main()
+        finally:
+            gerador.generate_danfse_from_xml = original_gerador
+
+        self.assertEqual(vistos.get("resumo"), [True])
+
+    @staticmethod
+    def _sempre_falha(xml_content, output_path):
+        raise RuntimeError("falha simulada da biblioteca")
+
+    def test_resumo_ganha_sufixo_no_nome_do_arquivo(self):
+        item = {"xml_path": Path("nota.xml"), "tipo": "NFSe",
+                "chave": "3" * 50, "pdf_temp": self.tmp / "x.pdf", "resumo": True}
+        (self.tmp / "x.pdf").write_bytes(b"%PDF-1.4")
+        linhas = []
+        c.finalizar_item(item, [date(2026, 8, 10)], "manual", linhas)
+        self.assertEqual(self.caminhos(), [
+            str(Path("2026") / "08 - Agosto" / "10-08-2026" / f"{'3' * 50}_SEM_PDF_OFICIAL.pdf")
+        ])
 
     def test_log_registra_o_metodo_do_prazo(self):
         c.perguntar_prazo_cte = lambda padrao=0: 28

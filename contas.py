@@ -4,8 +4,7 @@ Gera o PDF (DANFE/DACTE/DANFSe) localmente a partir do XML - a pasta de
 origem so precisa conter os XMLs.
 
 Requisitos:
-    pip install pdfplumber pymupdf pillow "brazilfiscalreport[dacte]" pynfse-nacional
-    (se pynfse-nacional nao estiver no PyPI: pip install git+https://github.com/roberto-mello/pynfse-nacional)
+    pip install -r requirements.txt
 """
 
 import os
@@ -150,6 +149,35 @@ def extrair_vencimento_nfse(root):
 
 
 # ===================== GERACAO DE PDF =====================
+def remover_ibscbs(xml_texto):
+    """
+    Devolve o XML sem o grupo IBS/CBS (reforma tributaria), ou None se ele
+    nem existia.
+
+    Motivo: NFS-e que trazem o grupo com campo vazio (cIndOp, por exemplo)
+    derrubam o parser da pynfse_nacional. A propria biblioteca tenta ignorar
+    esse tipo de falha, mas a excecao dela nao herda de ValueError e escapa
+    do except. Sem o grupo, o parser devolve None e o DANFSe sai normal -
+    o grupo so carrega tributos, nada que apareca no controle de vencimento.
+
+    Mexe apenas na copia usada para desenhar o PDF; o XML gravado fica intacto.
+    """
+    raiz = ET.fromstring(xml_texto)
+    removidos = 0
+    for pai in raiz.iter():
+        for filho in list(pai):
+            if filho.tag.split("}")[-1] == "IBSCBS":
+                pai.remove(filho)
+                removidos += 1
+    if not removidos:
+        return None
+
+    # sem isto o ElementTree devolveria tudo prefixado com ns0:
+    if raiz.tag.startswith("{"):
+        ET.register_namespace("", raiz.tag[1:].split("}")[0])
+    return ET.tostring(raiz, encoding="unicode")
+
+
 def gerar_pdf(tipo, xml_texto, destino_pdf):
     if tipo == "NFe":
         from brazilfiscalreport.danfe import Danfe
@@ -159,9 +187,89 @@ def gerar_pdf(tipo, xml_texto, destino_pdf):
         Dacte(xml_texto).output(str(destino_pdf))
     elif tipo == "NFSe":
         from pynfse_nacional.pdf_generator import generate_danfse_from_xml
-        generate_danfse_from_xml(xml_content=xml_texto, output_path=str(destino_pdf))
+        try:
+            generate_danfse_from_xml(xml_content=xml_texto, output_path=str(destino_pdf))
+        except Exception:
+            sem_ibscbs = remover_ibscbs(xml_texto)
+            if sem_ibscbs is None:
+                raise
+            generate_danfse_from_xml(
+                xml_content=sem_ibscbs, output_path=str(destino_pdf)
+            )
     else:
         raise ValueError(f"Tipo desconhecido, nao sei gerar PDF: {tipo}")
+
+
+# Campos aproveitados no PDF de resumo, em ordem de preferencia
+CAMPOS_RESUMO = (
+    ("Numero", ("nNFSe", "nNF", "nCT")),
+    ("Serie", ("serie",)),
+    ("Emissao", ("dhEmi", "dEmi", "dhProc")),
+    ("Valor", ("vLiq", "vServ", "vNF", "vTPrest", "vRec")),
+    ("Emitente", ("xNome", "xFant")),
+    ("Descricao", ("xDescServ", "xTribNac", "xNat", "natOp")),
+)
+
+
+def primeiro_texto(root, tags):
+    for tag in tags:
+        for el in root.iter():
+            if el.tag.split("}")[-1] == tag and el.text and el.text.strip():
+                return el.text.strip()
+    return ""
+
+
+def gerar_pdf_resumo(root, tipo, chave, destino_pdf, motivo=""):
+    """
+    Plano B: quando nem a biblioteca oficial monta o documento, desenha uma
+    folha com os dados que dao para ler do XML. Assim a nota nao trava a fila
+    - da para conferir o vencimento e arquivar como qualquer outra.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    largura, altura = A4
+    pdf = rl_canvas.Canvas(str(destino_pdf), pagesize=A4)
+    y = altura - 25 * mm
+
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(20 * mm, y, f"RESUMO DO DOCUMENTO ({tipo})")
+    y -= 7 * mm
+    pdf.setFont("Helvetica", 9)
+    pdf.drawString(20 * mm, y, "O PDF oficial nao pode ser gerado a partir deste XML.")
+    y -= 12 * mm
+
+    linhas = [("Chave", chave or "(nao encontrada)")]
+    linhas += [(rotulo, primeiro_texto(root, tags)) for rotulo, tags in CAMPOS_RESUMO]
+
+    for rotulo, valor in linhas:
+        if not valor:
+            continue
+        pdf.setFont("Helvetica-Bold", 10)
+        pdf.drawString(20 * mm, y, f"{rotulo}:")
+        pdf.setFont("Helvetica", 10)
+        # quebra o que for comprido demais para a linha
+        texto = str(valor)
+        while texto:
+            pedaco, texto = texto[:78], texto[78:]
+            pdf.drawString(50 * mm, y, pedaco)
+            y -= 6 * mm
+        y -= 2 * mm
+
+    if motivo:
+        y -= 6 * mm
+        pdf.setFont("Helvetica-Oblique", 8)
+        pdf.drawString(20 * mm, y, "Motivo:")
+        y -= 5 * mm
+        motivo = str(motivo)
+        while motivo and y > 20 * mm:
+            pedaco, motivo = motivo[:105], motivo[105:]
+            pdf.drawString(20 * mm, y, pedaco)
+            y -= 4.5 * mm
+
+    pdf.showPage()
+    pdf.save()
 
 
 def extrair_vencimento_pdf(caminho_pdf):
@@ -227,7 +335,9 @@ def pasta_destino_para_data(data):
 
 def finalizar_item(item, vencimentos, metodo, linhas_log):
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    nome_pdf = (item["chave"] or item["xml_path"].stem) + ".pdf"
+    # o sufixo marca, na propria pasta, quem ficou sem o documento oficial
+    sufixo = "_SEM_PDF_OFICIAL" if item.get("resumo") else ""
+    nome_pdf = (item["chave"] or item["xml_path"].stem) + sufixo + ".pdf"
 
     if metodo == "pular":
         PASTA_PENDENTES.mkdir(parents=True, exist_ok=True)
@@ -668,7 +778,8 @@ def main():
 
     linhas_log = []
     fila_pendentes = []
-    contagem = {"auto": 0, "prazo_cte": 0, "manual": 0, "a_vista": 0, "pendente": 0}
+    contagem = {"auto": 0, "prazo_cte": 0, "manual": 0, "a_vista": 0,
+                "pendente": 0, "resumo": 0}
 
     with tempfile.TemporaryDirectory(prefix="notas_pdf_") as tmpdir_str:
         tmpdir = Path(tmpdir_str)
@@ -680,9 +791,20 @@ def main():
                 tipo = identificar_tipo(root)
                 chave = extrair_chave(root)
                 nome_pdf_temp = tmpdir / f"{chave or xml_path.stem}.pdf"
-                gerar_pdf(tipo, xml_texto, nome_pdf_temp)
 
-                item = {"xml_path": xml_path, "tipo": tipo, "chave": chave, "pdf_temp": nome_pdf_temp}
+                resumo = False
+                try:
+                    gerar_pdf(tipo, xml_texto, nome_pdf_temp)
+                except Exception as e:
+                    motivo = f"{type(e).__name__}: {e}"
+                    print(f"  {xml_path.name}: sem PDF oficial ({motivo})")
+                    print("    -> seguindo com um resumo do XML")
+                    gerar_pdf_resumo(root, tipo, chave, nome_pdf_temp, motivo)
+                    resumo = True
+                    contagem["resumo"] += 1
+
+                item = {"xml_path": xml_path, "tipo": tipo, "chave": chave,
+                        "pdf_temp": nome_pdf_temp, "resumo": resumo}
 
                 vencimentos = []
                 if tipo in ("NFe", "CTe"):
@@ -738,6 +860,11 @@ def main():
         f"{contagem['manual']} manual(is), {contagem['a_vista']} a vista, "
         f"{contagem['pendente']} pendente(s). Log: {ARQUIVO_LOG}"
     )
+    if contagem["resumo"]:
+        print(
+            f"Atencao: {contagem['resumo']} documento(s) sem PDF oficial - foram"
+            " arquivados como resumo, com _SEM_PDF_OFICIAL no nome."
+        )
 
 
 if __name__ == "__main__":
