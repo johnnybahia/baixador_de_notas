@@ -15,13 +15,38 @@ continua de onde a anterior parou, e o ponteiro fica gravado em
 
 ## Instalação
 
-```bash
-pip install -r requirements.txt
-cp config.ini.exemplo config.ini      # no Windows: copy
+Precisa do **Python 3.9 ou mais novo**. Baixe em [python.org](https://www.python.org/downloads/)
+e, no instalador, deixe marcado **"Add python.exe to PATH"** e **"tcl/tk and IDLE"**
+(esse segundo é o que desenha a janela do classificador).
+
+Abra o Prompt de Comando **na pasta do projeto** e rode:
+
+```bat
+cd /d "C:\Users\juy\OneDrive\SEPARADOR DE NOTAS PARA PAGAMENTO"
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+copy config.ini.exemplo config.ini
 ```
 
-Edite o `config.ini` com o CNPJ, o caminho do `.pfx`, a senha e as pastas.
+Isso instala as dependências dos dois programas de uma vez. Para conferir:
+
+```bat
+python -c "import requests, pdfplumber, pymupdf, tkinter; print('ok')"
+```
+
+Depois edite o `config.ini` com o CNPJ, o caminho do `.pfx`, a senha e as pastas.
 O `config.ini` está no `.gitignore` porque guarda a senha do certificado.
+
+### Se der erro
+
+| Mensagem | O que fazer |
+|---|---|
+| `'python' não é reconhecido` | reinstale o Python marcando "Add python.exe to PATH", ou use `py` no lugar de `python` |
+| `No module named pip` | `python -m ensurepip --upgrade` |
+| `No module named tkinter` | reinstale o Python marcando "tcl/tk and IDLE" |
+| `Could not open requirements file` | você não está na pasta do projeto — use o `cd /d` acima |
+| `Access is denied` / permissão | `python -m pip install --user -r requirements.txt` |
+| `O pacote reportlab é obrigatório` | seu `pynfse-nacional` veio sem o extra: `python -m pip install "pynfse-nacional[pdf]"` |
 
 ## Uso
 
