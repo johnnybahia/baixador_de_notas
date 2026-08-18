@@ -11,6 +11,7 @@ pymupdf>=1.24             # desenha o PDF na tela, com zoom
 pillow>=10.0              # leva a imagem do PDF para a janela
 brazilfiscalreport[dacte]>=1.0   # gera DANFE (NF-e) e DACTE (CT-e)
 pynfse-nacional[pdf]>=0.9        # gera DANFSe (NFS-e) - o extra [pdf] e obrigatorio
+reportlab>=4.0            # desenha o PDF de resumo quando o oficial falha
 
 # A interface usa tkinter, que ja vem com o Python no Windows
 # (no instalador, deixe marcado "tcl/tk and IDLE").
